@@ -1,862 +1,1031 @@
-from __future__ import annotations
-
-import email.feedparser
-import email.header
-import email.message
-import email.parser
-import email.policy
-import pathlib
-import sys
-import typing
-from typing import (
-    Any,
-    Callable,
-    Generic,
-    Literal,
-    TypedDict,
-    cast,
-)
-
-from . import licenses, requirements, specifiers, utils
-from . import version as version_module
-from .licenses import NormalizedLicenseExpression
-
-T = typing.TypeVar("T")
-
-
-if sys.version_info >= (3, 11):  # pragma: no cover
-    ExceptionGroup = ExceptionGroup
-else:  # pragma: no cover
-
-    class ExceptionGroup(Exception):
-        """A minimal implementation of :external:exc:`ExceptionGroup` from Python 3.11.
-
-        If :external:exc:`ExceptionGroup` is already defined by Python itself,
-        that version is used instead.
-        """
-
-        message: str
-        exceptions: list[Exception]
-
-        def __init__(self, message: str, exceptions: list[Exception]) -> None:
-            self.message = message
-            self.exceptions = exceptions
-
-        def __repr__(self) -> str:
-            return f"{self.__class__.__name__}({self.message!r}, {self.exceptions!r})"
-
-
-class InvalidMetadata(ValueError):
-    """A metadata field contains invalid data."""
-
-    field: str
-    """The name of the field that contains invalid data."""
-
-    def __init__(self, field: str, message: str) -> None:
-        self.field = field
-        super().__init__(message)
-
-
-# The RawMetadata class attempts to make as few assumptions about the underlying
-# serialization formats as possible. The idea is that as long as a serialization
-# formats offer some very basic primitives in *some* way then we can support
-# serializing to and from that format.
-class RawMetadata(TypedDict, total=False):
-    """A dictionary of raw core metadata.
-
-    Each field in core metadata maps to a key of this dictionary (when data is
-    provided). The key is lower-case and underscores are used instead of dashes
-    compared to the equivalent core metadata field. Any core metadata field that
-    can be specified multiple times or can hold multiple values in a single
-    field have a key with a plural name. See :class:`Metadata` whose attributes
-    match the keys of this dictionary.
-
-    Core metadata fields that can be specified multiple times are stored as a
-    list or dict depending on which is appropriate for the field. Any fields
-    which hold multiple values in a single field are stored as a list.
-
-    """
-
-    # Metadata 1.0 - PEP 241
-    metadata_version: str
-    name: str
-    version: str
-    platforms: list[str]
-    summary: str
-    description: str
-    keywords: list[str]
-    home_page: str
-    author: str
-    author_email: str
-    license: str
-
-    # Metadata 1.1 - PEP 314
-    supported_platforms: list[str]
-    download_url: str
-    classifiers: list[str]
-    requires: list[str]
-    provides: list[str]
-    obsoletes: list[str]
-
-    # Metadata 1.2 - PEP 345
-    maintainer: str
-    maintainer_email: str
-    requires_dist: list[str]
-    provides_dist: list[str]
-    obsoletes_dist: list[str]
-    requires_python: str
-    requires_external: list[str]
-    project_urls: dict[str, str]
-
-    # Metadata 2.0
-    # PEP 426 attempted to completely revamp the metadata format
-    # but got stuck without ever being able to build consensus on
-    # it and ultimately ended up withdrawn.
-    #
-    # However, a number of tools had started emitting METADATA with
-    # `2.0` Metadata-Version, so for historical reasons, this version
-    # was skipped.
-
-    # Metadata 2.1 - PEP 566
-    description_content_type: str
-    provides_extra: list[str]
-
-    # Metadata 2.2 - PEP 643
-    dynamic: list[str]
-
-    # Metadata 2.3 - PEP 685
-    # No new fields were added in PEP 685, just some edge case were
-    # tightened up to provide better interoptability.
-
-    # Metadata 2.4 - PEP 639
-    license_expression: str
-    license_files: list[str]
-
-
-_STRING_FIELDS = {
-    "author",
-    "author_email",
-    "description",
-    "description_content_type",
-    "download_url",
-    "home_page",
-    "license",
-    "license_expression",
-    "maintainer",
-    "maintainer_email",
-    "metadata_version",
-    "name",
-    "requires_python",
-    "summary",
-    "version",
-}
-
-_LIST_FIELDS = {
-    "classifiers",
-    "dynamic",
-    "license_files",
-    "obsoletes",
-    "obsoletes_dist",
-    "platforms",
-    "provides",
-    "provides_dist",
-    "provides_extra",
-    "requires",
-    "requires_dist",
-    "requires_external",
-    "supported_platforms",
-}
-
-_DICT_FIELDS = {
-    "project_urls",
-}
-
-
-def _parse_keywords(data: str) -> list[str]:
-    """Split a string of comma-separated keywords into a list of keywords."""
-    return [k.strip() for k in data.split(",")]
-
-
-def _parse_project_urls(data: list[str]) -> dict[str, str]:
-    """Parse a list of label/URL string pairings separated by a comma."""
-    urls = {}
-    for pair in data:
-        # Our logic is slightly tricky here as we want to try and do
-        # *something* reasonable with malformed data.
-        #
-        # The main thing that we have to worry about, is data that does
-        # not have a ',' at all to split the label from the Value. There
-        # isn't a singular right answer here, and we will fail validation
-        # later on (if the caller is validating) so it doesn't *really*
-        # matter, but since the missing value has to be an empty str
-        # and our return value is dict[str, str], if we let the key
-        # be the missing value, then they'd have multiple '' values that
-        # overwrite each other in a accumulating dict.
-        #
-        # The other potentional issue is that it's possible to have the
-        # same label multiple times in the metadata, with no solid "right"
-        # answer with what to do in that case. As such, we'll do the only
-        # thing we can, which is treat the field as unparseable and add it
-        # to our list of unparsed fields.
-        parts = [p.strip() for p in pair.split(",", 1)]
-        parts.extend([""] * (max(0, 2 - len(parts))))  # Ensure 2 items
-
-        # TODO: The spec doesn't say anything about if the keys should be
-        #       considered case sensitive or not... logically they should
-        #       be case-preserving and case-insensitive, but doing that
-        #       would open up more cases where we might have duplicate
-        #       entries.
-        label, url = parts
-        if label in urls:
-            # The label already exists in our set of urls, so this field
-            # is unparseable, and we can just add the whole thing to our
-            # unparseable data and stop processing it.
-            raise KeyError("duplicate labels in project urls")
-        urls[label] = url
-
-    return urls
-
-
-def _get_payload(msg: email.message.Message, source: bytes | str) -> str:
-    """Get the body of the message."""
-    # If our source is a str, then our caller has managed encodings for us,
-    # and we don't need to deal with it.
-    if isinstance(source, str):
-        payload = msg.get_payload()
-        assert isinstance(payload, str)
-        return payload
-    # If our source is a bytes, then we're managing the encoding and we need
-    # to deal with it.
-    else:
-        bpayload = msg.get_payload(decode=True)
-        assert isinstance(bpayload, bytes)
-        try:
-            return bpayload.decode("utf8", "strict")
-        except UnicodeDecodeError as exc:
-            raise ValueError("payload in an invalid encoding") from exc
-
-
-# The various parse_FORMAT functions here are intended to be as lenient as
-# possible in their parsing, while still returning a correctly typed
-# RawMetadata.
+# -*- coding: utf-8 -*-
 #
-# To aid in this, we also generally want to do as little touching of the
-# data as possible, except where there are possibly some historic holdovers
-# that make valid data awkward to work with.
+# Copyright (C) 2012 The Python Software Foundation.
+# See LICENSE.txt and CONTRIBUTORS.txt.
 #
-# While this is a lower level, intermediate format than our ``Metadata``
-# class, some light touch ups can make a massive difference in usability.
+"""Implementation of the Metadata for Python packages PEPs.
 
-# Map METADATA fields to RawMetadata.
-_EMAIL_TO_RAW_MAPPING = {
-    "author": "author",
-    "author-email": "author_email",
-    "classifier": "classifiers",
-    "description": "description",
-    "description-content-type": "description_content_type",
-    "download-url": "download_url",
-    "dynamic": "dynamic",
-    "home-page": "home_page",
-    "keywords": "keywords",
-    "license": "license",
-    "license-expression": "license_expression",
-    "license-file": "license_files",
-    "maintainer": "maintainer",
-    "maintainer-email": "maintainer_email",
-    "metadata-version": "metadata_version",
-    "name": "name",
-    "obsoletes": "obsoletes",
-    "obsoletes-dist": "obsoletes_dist",
-    "platform": "platforms",
-    "project-url": "project_urls",
-    "provides": "provides",
-    "provides-dist": "provides_dist",
-    "provides-extra": "provides_extra",
-    "requires": "requires",
-    "requires-dist": "requires_dist",
-    "requires-external": "requires_external",
-    "requires-python": "requires_python",
-    "summary": "summary",
-    "supported-platform": "supported_platforms",
-    "version": "version",
-}
-_RAW_TO_EMAIL_MAPPING = {raw: email for email, raw in _EMAIL_TO_RAW_MAPPING.items()}
+Supports all metadata formats (1.0, 1.1, 1.2, 1.3/2.1 and 2.2).
+"""
+from __future__ import unicode_literals
+
+import codecs
+from email import message_from_file
+import json
+import logging
+import re
+
+from . import DistlibException, __version__
+from .compat import StringIO, string_types, text_type
+from .markers import interpret
+from .util import extract_by_key, get_extras
+from .version import get_scheme, PEP440_VERSION_RE
+
+logger = logging.getLogger(__name__)
 
 
-def parse_email(data: bytes | str) -> tuple[RawMetadata, dict[str, list[str]]]:
-    """Parse a distribution's metadata stored as email headers (e.g. from ``METADATA``).
-
-    This function returns a two-item tuple of dicts. The first dict is of
-    recognized fields from the core metadata specification. Fields that can be
-    parsed and translated into Python's built-in types are converted
-    appropriately. All other fields are left as-is. Fields that are allowed to
-    appear multiple times are stored as lists.
-
-    The second dict contains all other fields from the metadata. This includes
-    any unrecognized fields. It also includes any fields which are expected to
-    be parsed into a built-in type but were not formatted appropriately. Finally,
-    any fields that are expected to appear only once but are repeated are
-    included in this dict.
-
-    """
-    raw: dict[str, str | list[str] | dict[str, str]] = {}
-    unparsed: dict[str, list[str]] = {}
-
-    if isinstance(data, str):
-        parsed = email.parser.Parser(policy=email.policy.compat32).parsestr(data)
-    else:
-        parsed = email.parser.BytesParser(policy=email.policy.compat32).parsebytes(data)
-
-    # We have to wrap parsed.keys() in a set, because in the case of multiple
-    # values for a key (a list), the key will appear multiple times in the
-    # list of keys, but we're avoiding that by using get_all().
-    for name in frozenset(parsed.keys()):
-        # Header names in RFC are case insensitive, so we'll normalize to all
-        # lower case to make comparisons easier.
-        name = name.lower()
-
-        # We use get_all() here, even for fields that aren't multiple use,
-        # because otherwise someone could have e.g. two Name fields, and we
-        # would just silently ignore it rather than doing something about it.
-        headers = parsed.get_all(name) or []
-
-        # The way the email module works when parsing bytes is that it
-        # unconditionally decodes the bytes as ascii using the surrogateescape
-        # handler. When you pull that data back out (such as with get_all() ),
-        # it looks to see if the str has any surrogate escapes, and if it does
-        # it wraps it in a Header object instead of returning the string.
-        #
-        # As such, we'll look for those Header objects, and fix up the encoding.
-        value = []
-        # Flag if we have run into any issues processing the headers, thus
-        # signalling that the data belongs in 'unparsed'.
-        valid_encoding = True
-        for h in headers:
-            # It's unclear if this can return more types than just a Header or
-            # a str, so we'll just assert here to make sure.
-            assert isinstance(h, (email.header.Header, str))
-
-            # If it's a header object, we need to do our little dance to get
-            # the real data out of it. In cases where there is invalid data
-            # we're going to end up with mojibake, but there's no obvious, good
-            # way around that without reimplementing parts of the Header object
-            # ourselves.
-            #
-            # That should be fine since, if mojibacked happens, this key is
-            # going into the unparsed dict anyways.
-            if isinstance(h, email.header.Header):
-                # The Header object stores it's data as chunks, and each chunk
-                # can be independently encoded, so we'll need to check each
-                # of them.
-                chunks: list[tuple[bytes, str | None]] = []
-                for bin, encoding in email.header.decode_header(h):
-                    try:
-                        bin.decode("utf8", "strict")
-                    except UnicodeDecodeError:
-                        # Enable mojibake.
-                        encoding = "latin1"
-                        valid_encoding = False
-                    else:
-                        encoding = "utf8"
-                    chunks.append((bin, encoding))
-
-                # Turn our chunks back into a Header object, then let that
-                # Header object do the right thing to turn them into a
-                # string for us.
-                value.append(str(email.header.make_header(chunks)))
-            # This is already a string, so just add it.
-            else:
-                value.append(h)
-
-        # We've processed all of our values to get them into a list of str,
-        # but we may have mojibake data, in which case this is an unparsed
-        # field.
-        if not valid_encoding:
-            unparsed[name] = value
-            continue
-
-        raw_name = _EMAIL_TO_RAW_MAPPING.get(name)
-        if raw_name is None:
-            # This is a bit of a weird situation, we've encountered a key that
-            # we don't know what it means, so we don't know whether it's meant
-            # to be a list or not.
-            #
-            # Since we can't really tell one way or another, we'll just leave it
-            # as a list, even though it may be a single item list, because that's
-            # what makes the most sense for email headers.
-            unparsed[name] = value
-            continue
-
-        # If this is one of our string fields, then we'll check to see if our
-        # value is a list of a single item. If it is then we'll assume that
-        # it was emitted as a single string, and unwrap the str from inside
-        # the list.
-        #
-        # If it's any other kind of data, then we haven't the faintest clue
-        # what we should parse it as, and we have to just add it to our list
-        # of unparsed stuff.
-        if raw_name in _STRING_FIELDS and len(value) == 1:
-            raw[raw_name] = value[0]
-        # If this is one of our list of string fields, then we can just assign
-        # the value, since email *only* has strings, and our get_all() call
-        # above ensures that this is a list.
-        elif raw_name in _LIST_FIELDS:
-            raw[raw_name] = value
-        # Special Case: Keywords
-        # The keywords field is implemented in the metadata spec as a str,
-        # but it conceptually is a list of strings, and is serialized using
-        # ", ".join(keywords), so we'll do some light data massaging to turn
-        # this into what it logically is.
-        elif raw_name == "keywords" and len(value) == 1:
-            raw[raw_name] = _parse_keywords(value[0])
-        # Special Case: Project-URL
-        # The project urls is implemented in the metadata spec as a list of
-        # specially-formatted strings that represent a key and a value, which
-        # is fundamentally a mapping, however the email format doesn't support
-        # mappings in a sane way, so it was crammed into a list of strings
-        # instead.
-        #
-        # We will do a little light data massaging to turn this into a map as
-        # it logically should be.
-        elif raw_name == "project_urls":
-            try:
-                raw[raw_name] = _parse_project_urls(value)
-            except KeyError:
-                unparsed[name] = value
-        # Nothing that we've done has managed to parse this, so it'll just
-        # throw it in our unparseable data and move on.
-        else:
-            unparsed[name] = value
-
-    # We need to support getting the Description from the message payload in
-    # addition to getting it from the the headers. This does mean, though, there
-    # is the possibility of it being set both ways, in which case we put both
-    # in 'unparsed' since we don't know which is right.
-    try:
-        payload = _get_payload(parsed, data)
-    except ValueError:
-        unparsed.setdefault("description", []).append(
-            parsed.get_payload(decode=isinstance(data, bytes))  # type: ignore[call-overload]
-        )
-    else:
-        if payload:
-            # Check to see if we've already got a description, if so then both
-            # it, and this body move to unparseable.
-            if "description" in raw:
-                description_header = cast(str, raw.pop("description"))
-                unparsed.setdefault("description", []).extend(
-                    [description_header, payload]
-                )
-            elif "description" in unparsed:
-                unparsed["description"].append(payload)
-            else:
-                raw["description"] = payload
-
-    # We need to cast our `raw` to a metadata, because a TypedDict only support
-    # literal key names, but we're computing our key names on purpose, but the
-    # way this function is implemented, our `TypedDict` can only have valid key
-    # names.
-    return cast(RawMetadata, raw), unparsed
+class MetadataMissingError(DistlibException):
+    """A required metadata is missing"""
 
 
-_NOT_FOUND = object()
+class MetadataConflictError(DistlibException):
+    """Attempt to read or write metadata fields that are conflictual."""
 
 
-# Keep the two values in sync.
-_VALID_METADATA_VERSIONS = ["1.0", "1.1", "1.2", "2.1", "2.2", "2.3", "2.4"]
-_MetadataVersion = Literal["1.0", "1.1", "1.2", "2.1", "2.2", "2.3", "2.4"]
-
-_REQUIRED_ATTRS = frozenset(["metadata_version", "name", "version"])
+class MetadataUnrecognizedVersionError(DistlibException):
+    """Unknown metadata version number."""
 
 
-class _Validator(Generic[T]):
-    """Validate a metadata field.
+class MetadataInvalidError(DistlibException):
+    """A metadata value is invalid"""
 
-    All _process_*() methods correspond to a core metadata field. The method is
-    called with the field's raw value. If the raw value is valid it is returned
-    in its "enriched" form (e.g. ``version.Version`` for the ``Version`` field).
-    If the raw value is invalid, :exc:`InvalidMetadata` is raised (with a cause
-    as appropriate).
+
+# public API of this module
+__all__ = ['Metadata', 'PKG_INFO_ENCODING', 'PKG_INFO_PREFERRED_VERSION']
+
+# Encoding used for the PKG-INFO files
+PKG_INFO_ENCODING = 'utf-8'
+
+# preferred version. Hopefully will be changed
+# to 1.2 once PEP 345 is supported everywhere
+PKG_INFO_PREFERRED_VERSION = '1.1'
+
+_LINE_PREFIX_1_2 = re.compile('\n       \\|')
+_LINE_PREFIX_PRE_1_2 = re.compile('\n        ')
+_241_FIELDS = ('Metadata-Version', 'Name', 'Version', 'Platform', 'Summary', 'Description', 'Keywords', 'Home-page',
+               'Author', 'Author-email', 'License')
+
+_314_FIELDS = ('Metadata-Version', 'Name', 'Version', 'Platform', 'Supported-Platform', 'Summary', 'Description',
+               'Keywords', 'Home-page', 'Author', 'Author-email', 'License', 'Classifier', 'Download-URL', 'Obsoletes',
+               'Provides', 'Requires')
+
+_314_MARKERS = ('Obsoletes', 'Provides', 'Requires', 'Classifier', 'Download-URL')
+
+_345_FIELDS = ('Metadata-Version', 'Name', 'Version', 'Platform', 'Supported-Platform', 'Summary', 'Description',
+               'Keywords', 'Home-page', 'Author', 'Author-email', 'Maintainer', 'Maintainer-email', 'License',
+               'Classifier', 'Download-URL', 'Obsoletes-Dist', 'Project-URL', 'Provides-Dist', 'Requires-Dist',
+               'Requires-Python', 'Requires-External')
+
+_345_MARKERS = ('Provides-Dist', 'Requires-Dist', 'Requires-Python', 'Obsoletes-Dist', 'Requires-External',
+                'Maintainer', 'Maintainer-email', 'Project-URL')
+
+_426_FIELDS = ('Metadata-Version', 'Name', 'Version', 'Platform', 'Supported-Platform', 'Summary', 'Description',
+               'Keywords', 'Home-page', 'Author', 'Author-email', 'Maintainer', 'Maintainer-email', 'License',
+               'Classifier', 'Download-URL', 'Obsoletes-Dist', 'Project-URL', 'Provides-Dist', 'Requires-Dist',
+               'Requires-Python', 'Requires-External', 'Private-Version', 'Obsoleted-By', 'Setup-Requires-Dist',
+               'Extension', 'Provides-Extra')
+
+_426_MARKERS = ('Private-Version', 'Provides-Extra', 'Obsoleted-By', 'Setup-Requires-Dist', 'Extension')
+
+# See issue #106: Sometimes 'Requires' and 'Provides' occur wrongly in
+# the metadata. Include them in the tuple literal below to allow them
+# (for now).
+# Ditto for Obsoletes - see issue #140.
+_566_FIELDS = _426_FIELDS + ('Description-Content-Type', 'Requires', 'Provides', 'Obsoletes')
+
+_566_MARKERS = ('Description-Content-Type', )
+
+_643_MARKERS = ('Dynamic', 'License-File')
+
+_643_FIELDS = _566_FIELDS + _643_MARKERS
+
+_ALL_FIELDS = set()
+_ALL_FIELDS.update(_241_FIELDS)
+_ALL_FIELDS.update(_314_FIELDS)
+_ALL_FIELDS.update(_345_FIELDS)
+_ALL_FIELDS.update(_426_FIELDS)
+_ALL_FIELDS.update(_566_FIELDS)
+_ALL_FIELDS.update(_643_FIELDS)
+
+EXTRA_RE = re.compile(r'''extra\s*==\s*("([^"]+)"|'([^']+)')''')
+
+
+def _version2fieldlist(version):
+    if version == '1.0':
+        return _241_FIELDS
+    elif version == '1.1':
+        return _314_FIELDS
+    elif version == '1.2':
+        return _345_FIELDS
+    elif version in ('1.3', '2.1'):
+        # avoid adding field names if already there
+        return _345_FIELDS + tuple(f for f in _566_FIELDS if f not in _345_FIELDS)
+    elif version == '2.0':
+        raise ValueError('Metadata 2.0 is withdrawn and not supported')
+        # return _426_FIELDS
+    elif version == '2.2':
+        return _643_FIELDS
+    raise MetadataUnrecognizedVersionError(version)
+
+
+def _best_version(fields):
+    """Detect the best version depending on the fields used."""
+
+    def _has_marker(keys, markers):
+        return any(marker in keys for marker in markers)
+
+    keys = [key for key, value in fields.items() if value not in ([], 'UNKNOWN', None)]
+    possible_versions = ['1.0', '1.1', '1.2', '1.3', '2.1', '2.2']  # 2.0 removed
+
+    # first let's try to see if a field is not part of one of the version
+    for key in keys:
+        if key not in _241_FIELDS and '1.0' in possible_versions:
+            possible_versions.remove('1.0')
+            logger.debug('Removed 1.0 due to %s', key)
+        if key not in _314_FIELDS and '1.1' in possible_versions:
+            possible_versions.remove('1.1')
+            logger.debug('Removed 1.1 due to %s', key)
+        if key not in _345_FIELDS and '1.2' in possible_versions:
+            possible_versions.remove('1.2')
+            logger.debug('Removed 1.2 due to %s', key)
+        if key not in _566_FIELDS and '1.3' in possible_versions:
+            possible_versions.remove('1.3')
+            logger.debug('Removed 1.3 due to %s', key)
+        if key not in _566_FIELDS and '2.1' in possible_versions:
+            if key != 'Description':  # In 2.1, description allowed after headers
+                possible_versions.remove('2.1')
+                logger.debug('Removed 2.1 due to %s', key)
+        if key not in _643_FIELDS and '2.2' in possible_versions:
+            possible_versions.remove('2.2')
+            logger.debug('Removed 2.2 due to %s', key)
+        # if key not in _426_FIELDS and '2.0' in possible_versions:
+        # possible_versions.remove('2.0')
+        # logger.debug('Removed 2.0 due to %s', key)
+
+    # possible_version contains qualified versions
+    if len(possible_versions) == 1:
+        return possible_versions[0]  # found !
+    elif len(possible_versions) == 0:
+        logger.debug('Out of options - unknown metadata set: %s', fields)
+        raise MetadataConflictError('Unknown metadata set')
+
+    # let's see if one unique marker is found
+    is_1_1 = '1.1' in possible_versions and _has_marker(keys, _314_MARKERS)
+    is_1_2 = '1.2' in possible_versions and _has_marker(keys, _345_MARKERS)
+    is_2_1 = '2.1' in possible_versions and _has_marker(keys, _566_MARKERS)
+    # is_2_0 = '2.0' in possible_versions and _has_marker(keys, _426_MARKERS)
+    is_2_2 = '2.2' in possible_versions and _has_marker(keys, _643_MARKERS)
+    if int(is_1_1) + int(is_1_2) + int(is_2_1) + int(is_2_2) > 1:
+        raise MetadataConflictError('You used incompatible 1.1/1.2/2.1/2.2 fields')
+
+    # we have the choice, 1.0, or 1.2, 2.1 or 2.2
+    #   - 1.0 has a broken Summary field but works with all tools
+    #   - 1.1 is to avoid
+    #   - 1.2 fixes Summary but has little adoption
+    #   - 2.1 adds more features
+    #   - 2.2 is the latest
+    if not is_1_1 and not is_1_2 and not is_2_1 and not is_2_2:
+        # we couldn't find any specific marker
+        if PKG_INFO_PREFERRED_VERSION in possible_versions:
+            return PKG_INFO_PREFERRED_VERSION
+    if is_1_1:
+        return '1.1'
+    if is_1_2:
+        return '1.2'
+    if is_2_1:
+        return '2.1'
+    # if is_2_2:
+    # return '2.2'
+
+    return '2.2'
+
+
+# This follows the rules about transforming keys as described in
+# https://www.python.org/dev/peps/pep-0566/#id17
+_ATTR2FIELD = {name.lower().replace("-", "_"): name for name in _ALL_FIELDS}
+_FIELD2ATTR = {field: attr for attr, field in _ATTR2FIELD.items()}
+
+_PREDICATE_FIELDS = ('Requires-Dist', 'Obsoletes-Dist', 'Provides-Dist')
+_VERSIONS_FIELDS = ('Requires-Python', )
+_VERSION_FIELDS = ('Version', )
+_LISTFIELDS = ('Platform', 'Classifier', 'Obsoletes', 'Requires', 'Provides', 'Obsoletes-Dist', 'Provides-Dist',
+               'Requires-Dist', 'Requires-External', 'Project-URL', 'Supported-Platform', 'Setup-Requires-Dist',
+               'Provides-Extra', 'Extension', 'License-File')
+_LISTTUPLEFIELDS = ('Project-URL', )
+
+_ELEMENTSFIELD = ('Keywords', )
+
+_UNICODEFIELDS = ('Author', 'Maintainer', 'Summary', 'Description')
+
+_MISSING = object()
+
+_FILESAFE = re.compile('[^A-Za-z0-9.]+')
+
+
+def _get_name_and_version(name, version, for_filename=False):
+    """Return the distribution name with version.
+
+    If for_filename is true, return a filename-escaped form."""
+    if for_filename:
+        # For both name and version any runs of non-alphanumeric or '.'
+        # characters are replaced with a single '-'.  Additionally any
+        # spaces in the version string become '.'
+        name = _FILESAFE.sub('-', name)
+        version = _FILESAFE.sub('-', version.replace(' ', '.'))
+    return '%s-%s' % (name, version)
+
+
+class LegacyMetadata(object):
+    """The legacy metadata of a release.
+
+    Supports versions 1.0, 1.1, 1.2, 2.0 and 1.3/2.1 (auto-detected). You can
+    instantiate the class with one of these arguments (or none):
+    - *path*, the path to a metadata file
+    - *fileobj* give a file-like object with metadata as content
+    - *mapping* is a dict-like object
+    - *scheme* is a version scheme name
     """
 
-    name: str
-    raw_name: str
-    added: _MetadataVersion
+    # TODO document the mapping API and UNKNOWN default key
 
-    def __init__(
-        self,
-        *,
-        added: _MetadataVersion = "1.0",
-    ) -> None:
-        self.added = added
+    def __init__(self, path=None, fileobj=None, mapping=None, scheme='default'):
+        if [path, fileobj, mapping].count(None) < 2:
+            raise TypeError('path, fileobj and mapping are exclusive')
+        self._fields = {}
+        self.requires_files = []
+        self._dependencies = None
+        self.scheme = scheme
+        if path is not None:
+            self.read(path)
+        elif fileobj is not None:
+            self.read_file(fileobj)
+        elif mapping is not None:
+            self.update(mapping)
+            self.set_metadata_version()
 
-    def __set_name__(self, _owner: Metadata, name: str) -> None:
-        self.name = name
-        self.raw_name = _RAW_TO_EMAIL_MAPPING[name]
+    def set_metadata_version(self):
+        self._fields['Metadata-Version'] = _best_version(self._fields)
 
-    def __get__(self, instance: Metadata, _owner: type[Metadata]) -> T:
-        # With Python 3.8, the caching can be replaced with functools.cached_property().
-        # No need to check the cache as attribute lookup will resolve into the
-        # instance's __dict__ before __get__ is called.
-        cache = instance.__dict__
-        value = instance._raw.get(self.name)
+    def _write_field(self, fileobj, name, value):
+        fileobj.write('%s: %s\n' % (name, value))
 
-        # To make the _process_* methods easier, we'll check if the value is None
-        # and if this field is NOT a required attribute, and if both of those
-        # things are true, we'll skip the the converter. This will mean that the
-        # converters never have to deal with the None union.
-        if self.name in _REQUIRED_ATTRS or value is not None:
-            try:
-                converter: Callable[[Any], T] = getattr(self, f"_process_{self.name}")
-            except AttributeError:
-                pass
-            else:
-                value = converter(value)
+    def __getitem__(self, name):
+        return self.get(name)
 
-        cache[self.name] = value
+    def __setitem__(self, name, value):
+        return self.set(name, value)
+
+    def __delitem__(self, name):
+        field_name = self._convert_name(name)
         try:
-            del instance._raw[self.name]  # type: ignore[misc]
+            del self._fields[field_name]
         except KeyError:
+            raise KeyError(name)
+
+    def __contains__(self, name):
+        return (name in self._fields or self._convert_name(name) in self._fields)
+
+    def _convert_name(self, name):
+        if name in _ALL_FIELDS:
+            return name
+        name = name.replace('-', '_').lower()
+        return _ATTR2FIELD.get(name, name)
+
+    def _default_value(self, name):
+        if name in _LISTFIELDS or name in _ELEMENTSFIELD:
+            return []
+        return 'UNKNOWN'
+
+    def _remove_line_prefix(self, value):
+        if self.metadata_version in ('1.0', '1.1'):
+            return _LINE_PREFIX_PRE_1_2.sub('\n', value)
+        else:
+            return _LINE_PREFIX_1_2.sub('\n', value)
+
+    def __getattr__(self, name):
+        if name in _ATTR2FIELD:
+            return self[name]
+        raise AttributeError(name)
+
+    #
+    # Public API
+    #
+
+    def get_fullname(self, filesafe=False):
+        """
+        Return the distribution name with version.
+
+        If filesafe is true, return a filename-escaped form.
+        """
+        return _get_name_and_version(self['Name'], self['Version'], filesafe)
+
+    def is_field(self, name):
+        """return True if name is a valid metadata key"""
+        name = self._convert_name(name)
+        return name in _ALL_FIELDS
+
+    def is_multi_field(self, name):
+        name = self._convert_name(name)
+        return name in _LISTFIELDS
+
+    def read(self, filepath):
+        """Read the metadata values from a file path."""
+        fp = codecs.open(filepath, 'r', encoding='utf-8')
+        try:
+            self.read_file(fp)
+        finally:
+            fp.close()
+
+    def read_file(self, fileob):
+        """Read the metadata values from a file object."""
+        msg = message_from_file(fileob)
+        self._fields['Metadata-Version'] = msg['metadata-version']
+
+        # When reading, get all the fields we can
+        for field in _ALL_FIELDS:
+            if field not in msg:
+                continue
+            if field in _LISTFIELDS:
+                # we can have multiple lines
+                values = msg.get_all(field)
+                if field in _LISTTUPLEFIELDS and values is not None:
+                    values = [tuple(value.split(',')) for value in values]
+                self.set(field, values)
+            else:
+                # single line
+                value = msg[field]
+                if value is not None and value != 'UNKNOWN':
+                    self.set(field, value)
+
+        # PEP 566 specifies that the body be used for the description, if
+        # available
+        body = msg.get_payload()
+        self["Description"] = body if body else self["Description"]
+        # logger.debug('Attempting to set metadata for %s', self)
+        # self.set_metadata_version()
+
+    def write(self, filepath, skip_unknown=False):
+        """Write the metadata fields to filepath."""
+        fp = codecs.open(filepath, 'w', encoding='utf-8')
+        try:
+            self.write_file(fp, skip_unknown)
+        finally:
+            fp.close()
+
+    def write_file(self, fileobject, skip_unknown=False):
+        """Write the PKG-INFO format data to a file object."""
+        self.set_metadata_version()
+
+        for field in _version2fieldlist(self['Metadata-Version']):
+            values = self.get(field)
+            if skip_unknown and values in ('UNKNOWN', [], ['UNKNOWN']):
+                continue
+            if field in _ELEMENTSFIELD:
+                self._write_field(fileobject, field, ','.join(values))
+                continue
+            if field not in _LISTFIELDS:
+                if field == 'Description':
+                    if self.metadata_version in ('1.0', '1.1'):
+                        values = values.replace('\n', '\n        ')
+                    else:
+                        values = values.replace('\n', '\n       |')
+                values = [values]
+
+            if field in _LISTTUPLEFIELDS:
+                values = [','.join(value) for value in values]
+
+            for value in values:
+                self._write_field(fileobject, field, value)
+
+    def update(self, other=None, **kwargs):
+        """Set metadata values from the given iterable `other` and kwargs.
+
+        Behavior is like `dict.update`: If `other` has a ``keys`` method,
+        they are looped over and ``self[key]`` is assigned ``other[key]``.
+        Else, ``other`` is an iterable of ``(key, value)`` iterables.
+
+        Keys that don't match a metadata field or that have an empty value are
+        dropped.
+        """
+
+        def _set(key, value):
+            if key in _ATTR2FIELD and value:
+                self.set(self._convert_name(key), value)
+
+        if not other:
+            # other is None or empty container
             pass
-
-        return cast(T, value)
-
-    def _invalid_metadata(
-        self, msg: str, cause: Exception | None = None
-    ) -> InvalidMetadata:
-        exc = InvalidMetadata(
-            self.raw_name, msg.format_map({"field": repr(self.raw_name)})
-        )
-        exc.__cause__ = cause
-        return exc
-
-    def _process_metadata_version(self, value: str) -> _MetadataVersion:
-        # Implicitly makes Metadata-Version required.
-        if value not in _VALID_METADATA_VERSIONS:
-            raise self._invalid_metadata(f"{value!r} is not a valid metadata version")
-        return cast(_MetadataVersion, value)
-
-    def _process_name(self, value: str) -> str:
-        if not value:
-            raise self._invalid_metadata("{field} is a required field")
-        # Validate the name as a side-effect.
-        try:
-            utils.canonicalize_name(value, validate=True)
-        except utils.InvalidName as exc:
-            raise self._invalid_metadata(
-                f"{value!r} is invalid for {{field}}", cause=exc
-            ) from exc
+        elif hasattr(other, 'keys'):
+            for k in other.keys():
+                _set(k, other[k])
         else:
+            for k, v in other:
+                _set(k, v)
+
+        if kwargs:
+            for k, v in kwargs.items():
+                _set(k, v)
+
+    def set(self, name, value):
+        """Control then set a metadata field."""
+        name = self._convert_name(name)
+
+        if ((name in _ELEMENTSFIELD or name == 'Platform') and not isinstance(value, (list, tuple))):
+            if isinstance(value, string_types):
+                value = [v.strip() for v in value.split(',')]
+            else:
+                value = []
+        elif (name in _LISTFIELDS and not isinstance(value, (list, tuple))):
+            if isinstance(value, string_types):
+                value = [value]
+            else:
+                value = []
+
+        if logger.isEnabledFor(logging.WARNING):
+            project_name = self['Name']
+
+            scheme = get_scheme(self.scheme)
+            if name in _PREDICATE_FIELDS and value is not None:
+                for v in value:
+                    # check that the values are valid
+                    if not scheme.is_valid_matcher(v.split(';')[0]):
+                        logger.warning("'%s': '%s' is not valid (field '%s')", project_name, v, name)
+            # FIXME this rejects UNKNOWN, is that right?
+            elif name in _VERSIONS_FIELDS and value is not None:
+                if not scheme.is_valid_constraint_list(value):
+                    logger.warning("'%s': '%s' is not a valid version (field '%s')", project_name, value, name)
+            elif name in _VERSION_FIELDS and value is not None:
+                if not scheme.is_valid_version(value):
+                    logger.warning("'%s': '%s' is not a valid version (field '%s')", project_name, value, name)
+
+        if name in _UNICODEFIELDS:
+            if name == 'Description':
+                value = self._remove_line_prefix(value)
+
+        self._fields[name] = value
+
+    def get(self, name, default=_MISSING):
+        """Get a metadata field."""
+        name = self._convert_name(name)
+        if name not in self._fields:
+            if default is _MISSING:
+                default = self._default_value(name)
+            return default
+        if name in _UNICODEFIELDS:
+            value = self._fields[name]
             return value
+        elif name in _LISTFIELDS:
+            value = self._fields[name]
+            if value is None:
+                return []
+            res = []
+            for val in value:
+                if name not in _LISTTUPLEFIELDS:
+                    res.append(val)
+                else:
+                    # That's for Project-URL
+                    res.append((val[0], val[1]))
+            return res
 
-    def _process_version(self, value: str) -> version_module.Version:
-        if not value:
-            raise self._invalid_metadata("{field} is a required field")
-        try:
-            return version_module.parse(value)
-        except version_module.InvalidVersion as exc:
-            raise self._invalid_metadata(
-                f"{value!r} is invalid for {{field}}", cause=exc
-            ) from exc
+        elif name in _ELEMENTSFIELD:
+            value = self._fields[name]
+            if isinstance(value, string_types):
+                return value.split(',')
+        return self._fields[name]
 
-    def _process_summary(self, value: str) -> str:
-        """Check the field contains no newlines."""
-        if "\n" in value:
-            raise self._invalid_metadata("{field} must be a single line")
-        return value
+    def check(self, strict=False):
+        """Check if the metadata is compliant. If strict is True then raise if
+        no Name or Version are provided"""
+        self.set_metadata_version()
 
-    def _process_description_content_type(self, value: str) -> str:
-        content_types = {"text/plain", "text/x-rst", "text/markdown"}
-        message = email.message.EmailMessage()
-        message["content-type"] = value
+        # XXX should check the versions (if the file was loaded)
+        missing, warnings = [], []
 
-        content_type, parameters = (
-            # Defaults to `text/plain` if parsing failed.
-            message.get_content_type().lower(),
-            message["content-type"].params,
-        )
-        # Check if content-type is valid or defaulted to `text/plain` and thus was
-        # not parseable.
-        if content_type not in content_types or content_type not in value.lower():
-            raise self._invalid_metadata(
-                f"{{field}} must be one of {list(content_types)}, not {value!r}"
-            )
+        for attr in ('Name', 'Version'):  # required by PEP 345
+            if attr not in self:
+                missing.append(attr)
 
-        charset = parameters.get("charset", "UTF-8")
-        if charset != "UTF-8":
-            raise self._invalid_metadata(
-                f"{{field}} can only specify the UTF-8 charset, not {list(charset)}"
-            )
+        if strict and missing != []:
+            msg = 'missing required metadata: %s' % ', '.join(missing)
+            raise MetadataMissingError(msg)
 
-        markdown_variants = {"GFM", "CommonMark"}
-        variant = parameters.get("variant", "GFM")  # Use an acceptable default.
-        if content_type == "text/markdown" and variant not in markdown_variants:
-            raise self._invalid_metadata(
-                f"valid Markdown variants for {{field}} are {list(markdown_variants)}, "
-                f"not {variant!r}",
-            )
-        return value
+        for attr in ('Home-page', 'Author'):
+            if attr not in self:
+                missing.append(attr)
 
-    def _process_dynamic(self, value: list[str]) -> list[str]:
-        for dynamic_field in map(str.lower, value):
-            if dynamic_field in {"name", "version", "metadata-version"}:
-                raise self._invalid_metadata(
-                    f"{dynamic_field!r} is not allowed as a dynamic field"
-                )
-            elif dynamic_field not in _EMAIL_TO_RAW_MAPPING:
-                raise self._invalid_metadata(
-                    f"{dynamic_field!r} is not a valid dynamic field"
-                )
-        return list(map(str.lower, value))
+        # checking metadata 1.2 (XXX needs to check 1.1, 1.0)
+        if self['Metadata-Version'] != '1.2':
+            return missing, warnings
 
-    def _process_provides_extra(
-        self,
-        value: list[str],
-    ) -> list[utils.NormalizedName]:
-        normalized_names = []
-        try:
-            for name in value:
-                normalized_names.append(utils.canonicalize_name(name, validate=True))
-        except utils.InvalidName as exc:
-            raise self._invalid_metadata(
-                f"{name!r} is invalid for {{field}}", cause=exc
-            ) from exc
-        else:
-            return normalized_names
+        scheme = get_scheme(self.scheme)
 
-    def _process_requires_python(self, value: str) -> specifiers.SpecifierSet:
-        try:
-            return specifiers.SpecifierSet(value)
-        except specifiers.InvalidSpecifier as exc:
-            raise self._invalid_metadata(
-                f"{value!r} is invalid for {{field}}", cause=exc
-            ) from exc
+        def are_valid_constraints(value):
+            for v in value:
+                if not scheme.is_valid_matcher(v.split(';')[0]):
+                    return False
+            return True
 
-    def _process_requires_dist(
-        self,
-        value: list[str],
-    ) -> list[requirements.Requirement]:
-        reqs = []
-        try:
-            for req in value:
-                reqs.append(requirements.Requirement(req))
-        except requirements.InvalidRequirement as exc:
-            raise self._invalid_metadata(
-                f"{req!r} is invalid for {{field}}", cause=exc
-            ) from exc
-        else:
-            return reqs
+        for fields, controller in ((_PREDICATE_FIELDS, are_valid_constraints),
+                                   (_VERSIONS_FIELDS, scheme.is_valid_constraint_list), (_VERSION_FIELDS,
+                                                                                         scheme.is_valid_version)):
+            for field in fields:
+                value = self.get(field, None)
+                if value is not None and not controller(value):
+                    warnings.append("Wrong value for '%s': %s" % (field, value))
 
-    def _process_license_expression(
-        self, value: str
-    ) -> NormalizedLicenseExpression | None:
-        try:
-            return licenses.canonicalize_license_expression(value)
-        except ValueError as exc:
-            raise self._invalid_metadata(
-                f"{value!r} is invalid for {{field}}", cause=exc
-            ) from exc
+        return missing, warnings
 
-    def _process_license_files(self, value: list[str]) -> list[str]:
-        paths = []
-        for path in value:
-            if ".." in path:
-                raise self._invalid_metadata(
-                    f"{path!r} is invalid for {{field}}, "
-                    "parent directory indicators are not allowed"
-                )
-            if "*" in path:
-                raise self._invalid_metadata(
-                    f"{path!r} is invalid for {{field}}, paths must be resolved"
-                )
-            if (
-                pathlib.PurePosixPath(path).is_absolute()
-                or pathlib.PureWindowsPath(path).is_absolute()
-            ):
-                raise self._invalid_metadata(
-                    f"{path!r} is invalid for {{field}}, paths must be relative"
-                )
-            if pathlib.PureWindowsPath(path).as_posix() != path:
-                raise self._invalid_metadata(
-                    f"{path!r} is invalid for {{field}}, paths must use '/' delimiter"
-                )
-            paths.append(path)
-        return paths
+    def todict(self, skip_missing=False):
+        """Return fields as a dict.
+
+        Field names will be converted to use the underscore-lowercase style
+        instead of hyphen-mixed case (i.e. home_page instead of Home-page).
+        This is as per https://www.python.org/dev/peps/pep-0566/#id17.
+        """
+        self.set_metadata_version()
+
+        fields = _version2fieldlist(self['Metadata-Version'])
+
+        data = {}
+
+        for field_name in fields:
+            if not skip_missing or field_name in self._fields:
+                key = _FIELD2ATTR[field_name]
+                if key != 'project_url':
+                    data[key] = self[field_name]
+                else:
+                    data[key] = [','.join(u) for u in self[field_name]]
+
+        return data
+
+    def add_requirements(self, requirements):
+        if self['Metadata-Version'] == '1.1':
+            # we can't have 1.1 metadata *and* Setuptools requires
+            for field in ('Obsoletes', 'Requires', 'Provides'):
+                if field in self:
+                    del self[field]
+        self['Requires-Dist'] += requirements
+
+    # Mapping API
+    # TODO could add iter* variants
+
+    def keys(self):
+        return list(_version2fieldlist(self['Metadata-Version']))
+
+    def __iter__(self):
+        for key in self.keys():
+            yield key
+
+    def values(self):
+        return [self[key] for key in self.keys()]
+
+    def items(self):
+        return [(key, self[key]) for key in self.keys()]
+
+    def __repr__(self):
+        return '<%s %s %s>' % (self.__class__.__name__, self.name, self.version)
 
 
-class Metadata:
-    """Representation of distribution metadata.
+METADATA_FILENAME = 'pydist.json'
+WHEEL_METADATA_FILENAME = 'metadata.json'
+LEGACY_METADATA_FILENAME = 'METADATA'
 
-    Compared to :class:`RawMetadata`, this class provides objects representing
-    metadata fields instead of only using built-in types. Any invalid metadata
-    will cause :exc:`InvalidMetadata` to be raised (with a
-    :py:attr:`~BaseException.__cause__` attribute as appropriate).
+
+class Metadata(object):
+    """
+    The metadata of a release. This implementation uses 2.1
+    metadata where possible. If not possible, it wraps a LegacyMetadata
+    instance which handles the key-value metadata format.
     """
 
-    _raw: RawMetadata
+    METADATA_VERSION_MATCHER = re.compile(r'^\d+(\.\d+)*$')
 
-    @classmethod
-    def from_raw(cls, data: RawMetadata, *, validate: bool = True) -> Metadata:
-        """Create an instance from :class:`RawMetadata`.
+    NAME_MATCHER = re.compile('^[0-9A-Z]([0-9A-Z_.-]*[0-9A-Z])?$', re.I)
 
-        If *validate* is true, all metadata will be validated. All exceptions
-        related to validation will be gathered and raised as an :class:`ExceptionGroup`.
-        """
-        ins = cls()
-        ins._raw = data.copy()  # Mutations occur due to caching enriched values.
+    FIELDNAME_MATCHER = re.compile('^[A-Z]([0-9A-Z-]*[0-9A-Z])?$', re.I)
 
-        if validate:
-            exceptions: list[Exception] = []
+    VERSION_MATCHER = PEP440_VERSION_RE
+
+    SUMMARY_MATCHER = re.compile('.{1,2047}')
+
+    METADATA_VERSION = '2.0'
+
+    GENERATOR = 'distlib (%s)' % __version__
+
+    MANDATORY_KEYS = {
+        'name': (),
+        'version': (),
+        'summary': ('legacy', ),
+    }
+
+    INDEX_KEYS = ('name version license summary description author '
+                  'author_email keywords platform home_page classifiers '
+                  'download_url')
+
+    DEPENDENCY_KEYS = ('extras run_requires test_requires build_requires '
+                       'dev_requires provides meta_requires obsoleted_by '
+                       'supports_environments')
+
+    SYNTAX_VALIDATORS = {
+        'metadata_version': (METADATA_VERSION_MATCHER, ()),
+        'name': (NAME_MATCHER, ('legacy', )),
+        'version': (VERSION_MATCHER, ('legacy', )),
+        'summary': (SUMMARY_MATCHER, ('legacy', )),
+        'dynamic': (FIELDNAME_MATCHER, ('legacy', )),
+    }
+
+    __slots__ = ('_legacy', '_data', 'scheme')
+
+    def __init__(self, path=None, fileobj=None, mapping=None, scheme='default'):
+        if [path, fileobj, mapping].count(None) < 2:
+            raise TypeError('path, fileobj and mapping are exclusive')
+        self._legacy = None
+        self._data = None
+        self.scheme = scheme
+        # import pdb; pdb.set_trace()
+        if mapping is not None:
             try:
-                metadata_version = ins.metadata_version
-                metadata_age = _VALID_METADATA_VERSIONS.index(metadata_version)
-            except InvalidMetadata as metadata_version_exc:
-                exceptions.append(metadata_version_exc)
-                metadata_version = None
-
-            # Make sure to check for the fields that are present, the required
-            # fields (so their absence can be reported).
-            fields_to_check = frozenset(ins._raw) | _REQUIRED_ATTRS
-            # Remove fields that have already been checked.
-            fields_to_check -= {"metadata_version"}
-
-            for key in fields_to_check:
+                self._validate_mapping(mapping, scheme)
+                self._data = mapping
+            except MetadataUnrecognizedVersionError:
+                self._legacy = LegacyMetadata(mapping=mapping, scheme=scheme)
+                self.validate()
+        else:
+            data = None
+            if path:
+                with open(path, 'rb') as f:
+                    data = f.read()
+            elif fileobj:
+                data = fileobj.read()
+            if data is None:
+                # Initialised with no args - to be added
+                self._data = {
+                    'metadata_version': self.METADATA_VERSION,
+                    'generator': self.GENERATOR,
+                }
+            else:
+                if not isinstance(data, text_type):
+                    data = data.decode('utf-8')
                 try:
-                    if metadata_version:
-                        # Can't use getattr() as that triggers descriptor protocol which
-                        # will fail due to no value for the instance argument.
-                        try:
-                            field_metadata_version = cls.__dict__[key].added
-                        except KeyError:
-                            exc = InvalidMetadata(key, f"unrecognized field: {key!r}")
-                            exceptions.append(exc)
-                            continue
-                        field_age = _VALID_METADATA_VERSIONS.index(
-                            field_metadata_version
-                        )
-                        if field_age > metadata_age:
-                            field = _RAW_TO_EMAIL_MAPPING[key]
-                            exc = InvalidMetadata(
-                                field,
-                                f"{field} introduced in metadata version "
-                                f"{field_metadata_version}, not {metadata_version}",
-                            )
-                            exceptions.append(exc)
-                            continue
-                    getattr(ins, key)
-                except InvalidMetadata as exc:
-                    exceptions.append(exc)
+                    self._data = json.loads(data)
+                    self._validate_mapping(self._data, scheme)
+                except ValueError:
+                    # Note: MetadataUnrecognizedVersionError does not
+                    # inherit from ValueError (it's a DistlibException,
+                    # which should not inherit from ValueError).
+                    # The ValueError comes from the json.load - if that
+                    # succeeds and we get a validation error, we want
+                    # that to propagate
+                    self._legacy = LegacyMetadata(fileobj=StringIO(data), scheme=scheme)
+                    self.validate()
 
-            if exceptions:
-                raise ExceptionGroup("invalid metadata", exceptions)
+    common_keys = set(('name', 'version', 'license', 'keywords', 'summary'))
 
-        return ins
+    none_list = (None, list)
+    none_dict = (None, dict)
 
-    @classmethod
-    def from_email(cls, data: bytes | str, *, validate: bool = True) -> Metadata:
-        """Parse metadata from email headers.
+    mapped_keys = {
+        'run_requires': ('Requires-Dist', list),
+        'build_requires': ('Setup-Requires-Dist', list),
+        'dev_requires': none_list,
+        'test_requires': none_list,
+        'meta_requires': none_list,
+        'extras': ('Provides-Extra', list),
+        'modules': none_list,
+        'namespaces': none_list,
+        'exports': none_dict,
+        'commands': none_dict,
+        'classifiers': ('Classifier', list),
+        'source_url': ('Download-URL', None),
+        'metadata_version': ('Metadata-Version', None),
+    }
 
-        If *validate* is true, the metadata will be validated. All exceptions
-        related to validation will be gathered and raised as an :class:`ExceptionGroup`.
-        """
-        raw, unparsed = parse_email(data)
+    del none_list, none_dict
 
-        if validate:
-            exceptions: list[Exception] = []
-            for unparsed_key in unparsed:
-                if unparsed_key in _EMAIL_TO_RAW_MAPPING:
-                    message = f"{unparsed_key!r} has invalid data"
+    def __getattribute__(self, key):
+        common = object.__getattribute__(self, 'common_keys')
+        mapped = object.__getattribute__(self, 'mapped_keys')
+        if key in mapped:
+            lk, maker = mapped[key]
+            if self._legacy:
+                if lk is None:
+                    result = None if maker is None else maker()
                 else:
-                    message = f"unrecognized field: {unparsed_key!r}"
-                exceptions.append(InvalidMetadata(unparsed_key, message))
+                    result = self._legacy.get(lk)
+            else:
+                value = None if maker is None else maker()
+                if key not in ('commands', 'exports', 'modules', 'namespaces', 'classifiers'):
+                    result = self._data.get(key, value)
+                else:
+                    # special cases for PEP 459
+                    sentinel = object()
+                    result = sentinel
+                    d = self._data.get('extensions')
+                    if d:
+                        if key == 'commands':
+                            result = d.get('python.commands', value)
+                        elif key == 'classifiers':
+                            d = d.get('python.details')
+                            if d:
+                                result = d.get(key, value)
+                        else:
+                            d = d.get('python.exports')
+                            if not d:
+                                d = self._data.get('python.exports')
+                            if d:
+                                result = d.get(key, value)
+                    if result is sentinel:
+                        result = value
+        elif key not in common:
+            result = object.__getattribute__(self, key)
+        elif self._legacy:
+            result = self._legacy.get(key)
+        else:
+            result = self._data.get(key)
+        return result
 
-            if exceptions:
-                raise ExceptionGroup("unparsed", exceptions)
+    def _validate_value(self, key, value, scheme=None):
+        if key in self.SYNTAX_VALIDATORS:
+            pattern, exclusions = self.SYNTAX_VALIDATORS[key]
+            if (scheme or self.scheme) not in exclusions:
+                m = pattern.match(value)
+                if not m:
+                    raise MetadataInvalidError("'%s' is an invalid value for "
+                                               "the '%s' property" % (value, key))
 
-        try:
-            return cls.from_raw(raw, validate=validate)
-        except ExceptionGroup as exc_group:
-            raise ExceptionGroup(
-                "invalid or unparsed metadata", exc_group.exceptions
-            ) from None
+    def __setattr__(self, key, value):
+        self._validate_value(key, value)
+        common = object.__getattribute__(self, 'common_keys')
+        mapped = object.__getattribute__(self, 'mapped_keys')
+        if key in mapped:
+            lk, _ = mapped[key]
+            if self._legacy:
+                if lk is None:
+                    raise NotImplementedError
+                self._legacy[lk] = value
+            elif key not in ('commands', 'exports', 'modules', 'namespaces', 'classifiers'):
+                self._data[key] = value
+            else:
+                # special cases for PEP 459
+                d = self._data.setdefault('extensions', {})
+                if key == 'commands':
+                    d['python.commands'] = value
+                elif key == 'classifiers':
+                    d = d.setdefault('python.details', {})
+                    d[key] = value
+                else:
+                    d = d.setdefault('python.exports', {})
+                    d[key] = value
+        elif key not in common:
+            object.__setattr__(self, key, value)
+        else:
+            if key == 'keywords':
+                if isinstance(value, string_types):
+                    value = value.strip()
+                    if value:
+                        value = value.split()
+                    else:
+                        value = []
+            if self._legacy:
+                self._legacy[key] = value
+            else:
+                self._data[key] = value
 
-    metadata_version: _Validator[_MetadataVersion] = _Validator()
-    """:external:ref:`core-metadata-metadata-version`
-    (required; validated to be a valid metadata version)"""
-    # `name` is not normalized/typed to NormalizedName so as to provide access to
-    # the original/raw name.
-    name: _Validator[str] = _Validator()
-    """:external:ref:`core-metadata-name`
-    (required; validated using :func:`~packaging.utils.canonicalize_name` and its
-    *validate* parameter)"""
-    version: _Validator[version_module.Version] = _Validator()
-    """:external:ref:`core-metadata-version` (required)"""
-    dynamic: _Validator[list[str] | None] = _Validator(
-        added="2.2",
-    )
-    """:external:ref:`core-metadata-dynamic`
-    (validated against core metadata field names and lowercased)"""
-    platforms: _Validator[list[str] | None] = _Validator()
-    """:external:ref:`core-metadata-platform`"""
-    supported_platforms: _Validator[list[str] | None] = _Validator(added="1.1")
-    """:external:ref:`core-metadata-supported-platform`"""
-    summary: _Validator[str | None] = _Validator()
-    """:external:ref:`core-metadata-summary` (validated to contain no newlines)"""
-    description: _Validator[str | None] = _Validator()  # TODO 2.1: can be in body
-    """:external:ref:`core-metadata-description`"""
-    description_content_type: _Validator[str | None] = _Validator(added="2.1")
-    """:external:ref:`core-metadata-description-content-type` (validated)"""
-    keywords: _Validator[list[str] | None] = _Validator()
-    """:external:ref:`core-metadata-keywords`"""
-    home_page: _Validator[str | None] = _Validator()
-    """:external:ref:`core-metadata-home-page`"""
-    download_url: _Validator[str | None] = _Validator(added="1.1")
-    """:external:ref:`core-metadata-download-url`"""
-    author: _Validator[str | None] = _Validator()
-    """:external:ref:`core-metadata-author`"""
-    author_email: _Validator[str | None] = _Validator()
-    """:external:ref:`core-metadata-author-email`"""
-    maintainer: _Validator[str | None] = _Validator(added="1.2")
-    """:external:ref:`core-metadata-maintainer`"""
-    maintainer_email: _Validator[str | None] = _Validator(added="1.2")
-    """:external:ref:`core-metadata-maintainer-email`"""
-    license: _Validator[str | None] = _Validator()
-    """:external:ref:`core-metadata-license`"""
-    license_expression: _Validator[NormalizedLicenseExpression | None] = _Validator(
-        added="2.4"
-    )
-    """:external:ref:`core-metadata-license-expression`"""
-    license_files: _Validator[list[str] | None] = _Validator(added="2.4")
-    """:external:ref:`core-metadata-license-file`"""
-    classifiers: _Validator[list[str] | None] = _Validator(added="1.1")
-    """:external:ref:`core-metadata-classifier`"""
-    requires_dist: _Validator[list[requirements.Requirement] | None] = _Validator(
-        added="1.2"
-    )
-    """:external:ref:`core-metadata-requires-dist`"""
-    requires_python: _Validator[specifiers.SpecifierSet | None] = _Validator(
-        added="1.2"
-    )
-    """:external:ref:`core-metadata-requires-python`"""
-    # Because `Requires-External` allows for non-PEP 440 version specifiers, we
-    # don't do any processing on the values.
-    requires_external: _Validator[list[str] | None] = _Validator(added="1.2")
-    """:external:ref:`core-metadata-requires-external`"""
-    project_urls: _Validator[dict[str, str] | None] = _Validator(added="1.2")
-    """:external:ref:`core-metadata-project-url`"""
-    # PEP 685 lets us raise an error if an extra doesn't pass `Name` validation
-    # regardless of metadata version.
-    provides_extra: _Validator[list[utils.NormalizedName] | None] = _Validator(
-        added="2.1",
-    )
-    """:external:ref:`core-metadata-provides-extra`"""
-    provides_dist: _Validator[list[str] | None] = _Validator(added="1.2")
-    """:external:ref:`core-metadata-provides-dist`"""
-    obsoletes_dist: _Validator[list[str] | None] = _Validator(added="1.2")
-    """:external:ref:`core-metadata-obsoletes-dist`"""
-    requires: _Validator[list[str] | None] = _Validator(added="1.1")
-    """``Requires`` (deprecated)"""
-    provides: _Validator[list[str] | None] = _Validator(added="1.1")
-    """``Provides`` (deprecated)"""
-    obsoletes: _Validator[list[str] | None] = _Validator(added="1.1")
-    """``Obsoletes`` (deprecated)"""
+    @property
+    def name_and_version(self):
+        return _get_name_and_version(self.name, self.version, True)
+
+    @property
+    def provides(self):
+        if self._legacy:
+            result = self._legacy['Provides-Dist']
+        else:
+            result = self._data.setdefault('provides', [])
+        s = '%s (%s)' % (self.name, self.version)
+        if s not in result:
+            result.append(s)
+        return result
+
+    @provides.setter
+    def provides(self, value):
+        if self._legacy:
+            self._legacy['Provides-Dist'] = value
+        else:
+            self._data['provides'] = value
+
+    def get_requirements(self, reqts, extras=None, env=None):
+        """
+        Base method to get dependencies, given a set of extras
+        to satisfy and an optional environment context.
+        :param reqts: A list of sometimes-wanted dependencies,
+                      perhaps dependent on extras and environment.
+        :param extras: A list of optional components being requested.
+        :param env: An optional environment for marker evaluation.
+        """
+        if self._legacy:
+            result = reqts
+        else:
+            result = []
+            extras = get_extras(extras or [], self.extras)
+            for d in reqts:
+                if 'extra' not in d and 'environment' not in d:
+                    # unconditional
+                    include = True
+                else:
+                    if 'extra' not in d:
+                        # Not extra-dependent - only environment-dependent
+                        include = True
+                    else:
+                        include = d.get('extra') in extras
+                    if include:
+                        # Not excluded because of extras, check environment
+                        marker = d.get('environment')
+                        if marker:
+                            include = interpret(marker, env)
+                if include:
+                    result.extend(d['requires'])
+            for key in ('build', 'dev', 'test'):
+                e = ':%s:' % key
+                if e in extras:
+                    extras.remove(e)
+                    # A recursive call, but it should terminate since 'test'
+                    # has been removed from the extras
+                    reqts = self._data.get('%s_requires' % key, [])
+                    result.extend(self.get_requirements(reqts, extras=extras, env=env))
+        return result
+
+    @property
+    def dictionary(self):
+        if self._legacy:
+            return self._from_legacy()
+        return self._data
+
+    @property
+    def dependencies(self):
+        if self._legacy:
+            raise NotImplementedError
+        else:
+            return extract_by_key(self._data, self.DEPENDENCY_KEYS)
+
+    @dependencies.setter
+    def dependencies(self, value):
+        if self._legacy:
+            raise NotImplementedError
+        else:
+            self._data.update(value)
+
+    def _validate_mapping(self, mapping, scheme):
+        if mapping.get('metadata_version') != self.METADATA_VERSION:
+            raise MetadataUnrecognizedVersionError()
+        missing = []
+        for key, exclusions in self.MANDATORY_KEYS.items():
+            if key not in mapping:
+                if scheme not in exclusions:
+                    missing.append(key)
+        if missing:
+            msg = 'Missing metadata items: %s' % ', '.join(missing)
+            raise MetadataMissingError(msg)
+        for k, v in mapping.items():
+            self._validate_value(k, v, scheme)
+
+    def validate(self):
+        if self._legacy:
+            missing, warnings = self._legacy.check(True)
+            if missing or warnings:
+                logger.warning('Metadata: missing: %s, warnings: %s', missing, warnings)
+        else:
+            self._validate_mapping(self._data, self.scheme)
+
+    def todict(self):
+        if self._legacy:
+            return self._legacy.todict(True)
+        else:
+            result = extract_by_key(self._data, self.INDEX_KEYS)
+            return result
+
+    def _from_legacy(self):
+        assert self._legacy and not self._data
+        result = {
+            'metadata_version': self.METADATA_VERSION,
+            'generator': self.GENERATOR,
+        }
+        lmd = self._legacy.todict(True)  # skip missing ones
+        for k in ('name', 'version', 'license', 'summary', 'description', 'classifier'):
+            if k in lmd:
+                if k == 'classifier':
+                    nk = 'classifiers'
+                else:
+                    nk = k
+                result[nk] = lmd[k]
+        kw = lmd.get('Keywords', [])
+        if kw == ['']:
+            kw = []
+        result['keywords'] = kw
+        keys = (('requires_dist', 'run_requires'), ('setup_requires_dist', 'build_requires'))
+        for ok, nk in keys:
+            if ok in lmd and lmd[ok]:
+                result[nk] = [{'requires': lmd[ok]}]
+        result['provides'] = self.provides
+        # author = {}
+        # maintainer = {}
+        return result
+
+    LEGACY_MAPPING = {
+        'name': 'Name',
+        'version': 'Version',
+        ('extensions', 'python.details', 'license'): 'License',
+        'summary': 'Summary',
+        'description': 'Description',
+        ('extensions', 'python.project', 'project_urls', 'Home'): 'Home-page',
+        ('extensions', 'python.project', 'contacts', 0, 'name'): 'Author',
+        ('extensions', 'python.project', 'contacts', 0, 'email'): 'Author-email',
+        'source_url': 'Download-URL',
+        ('extensions', 'python.details', 'classifiers'): 'Classifier',
+    }
+
+    def _to_legacy(self):
+
+        def process_entries(entries):
+            reqts = set()
+            for e in entries:
+                extra = e.get('extra')
+                env = e.get('environment')
+                rlist = e['requires']
+                for r in rlist:
+                    if not env and not extra:
+                        reqts.add(r)
+                    else:
+                        marker = ''
+                        if extra:
+                            marker = 'extra == "%s"' % extra
+                        if env:
+                            if marker:
+                                marker = '(%s) and %s' % (env, marker)
+                            else:
+                                marker = env
+                        reqts.add(';'.join((r, marker)))
+            return reqts
+
+        assert self._data and not self._legacy
+        result = LegacyMetadata()
+        nmd = self._data
+        # import pdb; pdb.set_trace()
+        for nk, ok in self.LEGACY_MAPPING.items():
+            if not isinstance(nk, tuple):
+                if nk in nmd:
+                    result[ok] = nmd[nk]
+            else:
+                d = nmd
+                found = True
+                for k in nk:
+                    try:
+                        d = d[k]
+                    except (KeyError, IndexError):
+                        found = False
+                        break
+                if found:
+                    result[ok] = d
+        r1 = process_entries(self.run_requires + self.meta_requires)
+        r2 = process_entries(self.build_requires + self.dev_requires)
+        if self.extras:
+            result['Provides-Extra'] = sorted(self.extras)
+        result['Requires-Dist'] = sorted(r1)
+        result['Setup-Requires-Dist'] = sorted(r2)
+        # TODO: any other fields wanted
+        return result
+
+    def write(self, path=None, fileobj=None, legacy=False, skip_unknown=True):
+        if [path, fileobj].count(None) != 1:
+            raise ValueError('Exactly one of path and fileobj is needed')
+        self.validate()
+        if legacy:
+            if self._legacy:
+                legacy_md = self._legacy
+            else:
+                legacy_md = self._to_legacy()
+            if path:
+                legacy_md.write(path, skip_unknown=skip_unknown)
+            else:
+                legacy_md.write_file(fileobj, skip_unknown=skip_unknown)
+        else:
+            if self._legacy:
+                d = self._from_legacy()
+            else:
+                d = self._data
+            if fileobj:
+                json.dump(d, fileobj, ensure_ascii=True, indent=2, sort_keys=True)
+            else:
+                with codecs.open(path, 'w', 'utf-8') as f:
+                    json.dump(d, f, ensure_ascii=True, indent=2, sort_keys=True)
+
+    def add_requirements(self, requirements):
+        if self._legacy:
+            self._legacy.add_requirements(requirements)
+        else:
+            run_requires = self._data.setdefault('run_requires', [])
+            always = None
+            for entry in run_requires:
+                if 'environment' not in entry and 'extra' not in entry:
+                    always = entry
+                    break
+            if always is None:
+                always = {'requires': requirements}
+                run_requires.insert(0, always)
+            else:
+                rset = set(always['requires']) | set(requirements)
+                always['requires'] = sorted(rset)
+
+    def __repr__(self):
+        name = self.name or '(no name)'
+        version = self.version or 'no version'
+        return '<%s %s %s (%s)>' % (self.__class__.__name__, self.metadata_version, name, version)
