@@ -1,117 +1,102 @@
 """
-pip._vendor is for vendoring dependencies of pip to prevent needing pip to
-depend on something external.
-
-Files inside of pip._vendor should be considered immutable and should only be
-updated to versions from upstream.
+Python HTTP library with thread-safe connection pooling, file post support, user friendly, and more
 """
 from __future__ import absolute_import
 
-import glob
-import os.path
-import sys
+# Set default logging handler to avoid "No handler found" warnings.
+import logging
+import warnings
+from logging import NullHandler
 
-# Downstream redistributors which have debundled our dependencies should also
-# patch this value to be true. This will trigger the additional patching
-# to cause things like "six" to be available as pip.
-DEBUNDLED = False
+from . import exceptions
+from ._version import __version__
+from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
+from .filepost import encode_multipart_formdata
+from .poolmanager import PoolManager, ProxyManager, proxy_from_url
+from .response import HTTPResponse
+from .util.request import make_headers
+from .util.retry import Retry
+from .util.timeout import Timeout
+from .util.url import get_host
 
-# By default, look in this directory for a bunch of .whl files which we will
-# add to the beginning of sys.path before attempting to import anything. This
-# is done to support downstream re-distributors like Debian and Fedora who
-# wish to create their own Wheels for our dependencies to aid in debundling.
-WHEEL_DIR = os.path.abspath(os.path.dirname(__file__))
+# === NOTE TO REPACKAGERS AND VENDORS ===
+# Please delete this block, this logic is only
+# for urllib3 being distributed via PyPI.
+# See: https://github.com/urllib3/urllib3/issues/2680
+try:
+    import urllib3_secure_extra  # type: ignore # noqa: F401
+except ImportError:
+    pass
+else:
+    warnings.warn(
+        "'urllib3[secure]' extra is deprecated and will be removed "
+        "in a future release of urllib3 2.x. Read more in this issue: "
+        "https://github.com/urllib3/urllib3/issues/2680",
+        category=DeprecationWarning,
+        stacklevel=2,
+    )
+
+__author__ = "Andrey Petrov (andrey.petrov@shazow.net)"
+__license__ = "MIT"
+__version__ = __version__
+
+__all__ = (
+    "HTTPConnectionPool",
+    "HTTPSConnectionPool",
+    "PoolManager",
+    "ProxyManager",
+    "HTTPResponse",
+    "Retry",
+    "Timeout",
+    "add_stderr_logger",
+    "connection_from_url",
+    "disable_warnings",
+    "encode_multipart_formdata",
+    "get_host",
+    "make_headers",
+    "proxy_from_url",
+)
+
+logging.getLogger(__name__).addHandler(NullHandler())
 
 
-# Define a small helper function to alias our vendored modules to the real ones
-# if the vendored ones do not exist. This idea of this was taken from
-# https://github.com/kennethreitz/requests/pull/2567.
-def vendored(modulename):
-    vendored_name = "{0}.{1}".format(__name__, modulename)
+def add_stderr_logger(level=logging.DEBUG):
+    """
+    Helper for quickly adding a StreamHandler to the logger. Useful for
+    debugging.
 
-    try:
-        __import__(modulename, globals(), locals(), level=0)
-    except ImportError:
-        # We can just silently allow import failures to pass here. If we
-        # got to this point it means that ``import pip._vendor.whatever``
-        # failed and so did ``import whatever``. Since we're importing this
-        # upfront in an attempt to alias imports, not erroring here will
-        # just mean we get a regular import error whenever pip *actually*
-        # tries to import one of these modules to use it, which actually
-        # gives us a better error message than we would have otherwise
-        # gotten.
-        pass
-    else:
-        sys.modules[vendored_name] = sys.modules[modulename]
-        base, head = vendored_name.rsplit(".", 1)
-        setattr(sys.modules[base], head, sys.modules[modulename])
+    Returns the handler after adding it.
+    """
+    # This method needs to be in this __init__.py to get the __name__ correct
+    # even if urllib3 is vendored within another package.
+    logger = logging.getLogger(__name__)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.debug("Added a stderr logging handler to logger: %s", __name__)
+    return handler
 
 
-# If we're operating in a debundled setup, then we want to go ahead and trigger
-# the aliasing of our vendored libraries as well as looking for wheels to add
-# to our sys.path. This will cause all of this code to be a no-op typically
-# however downstream redistributors can enable it in a consistent way across
-# all platforms.
-if DEBUNDLED:
-    # Actually look inside of WHEEL_DIR to find .whl files and add them to the
-    # front of our sys.path.
-    sys.path[:] = glob.glob(os.path.join(WHEEL_DIR, "*.whl")) + sys.path
+# ... Clean up.
+del NullHandler
 
-    # Actually alias all of our vendored dependencies.
-    vendored("cachecontrol")
-    vendored("certifi")
-    vendored("dependency-groups")
-    vendored("distlib")
-    vendored("distro")
-    vendored("packaging")
-    vendored("packaging.version")
-    vendored("packaging.specifiers")
-    vendored("pkg_resources")
-    vendored("platformdirs")
-    vendored("progress")
-    vendored("pyproject_hooks")
-    vendored("requests")
-    vendored("requests.exceptions")
-    vendored("requests.packages")
-    vendored("requests.packages.urllib3")
-    vendored("requests.packages.urllib3._collections")
-    vendored("requests.packages.urllib3.connection")
-    vendored("requests.packages.urllib3.connectionpool")
-    vendored("requests.packages.urllib3.contrib")
-    vendored("requests.packages.urllib3.contrib.ntlmpool")
-    vendored("requests.packages.urllib3.contrib.pyopenssl")
-    vendored("requests.packages.urllib3.exceptions")
-    vendored("requests.packages.urllib3.fields")
-    vendored("requests.packages.urllib3.filepost")
-    vendored("requests.packages.urllib3.packages")
-    vendored("requests.packages.urllib3.packages.ordered_dict")
-    vendored("requests.packages.urllib3.packages.six")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname."
-             "_implementation")
-    vendored("requests.packages.urllib3.poolmanager")
-    vendored("requests.packages.urllib3.request")
-    vendored("requests.packages.urllib3.response")
-    vendored("requests.packages.urllib3.util")
-    vendored("requests.packages.urllib3.util.connection")
-    vendored("requests.packages.urllib3.util.request")
-    vendored("requests.packages.urllib3.util.response")
-    vendored("requests.packages.urllib3.util.retry")
-    vendored("requests.packages.urllib3.util.ssl_")
-    vendored("requests.packages.urllib3.util.timeout")
-    vendored("requests.packages.urllib3.util.url")
-    vendored("resolvelib")
-    vendored("rich")
-    vendored("rich.console")
-    vendored("rich.highlighter")
-    vendored("rich.logging")
-    vendored("rich.markup")
-    vendored("rich.progress")
-    vendored("rich.segment")
-    vendored("rich.style")
-    vendored("rich.text")
-    vendored("rich.traceback")
-    if sys.version_info < (3, 11):
-        vendored("tomli")
-    vendored("truststore")
-    vendored("urllib3")
+
+# All warning filters *must* be appended unless you're really certain that they
+# shouldn't be: otherwise, it's very hard for users to use most Python
+# mechanisms to silence them.
+# SecurityWarning's always go off by default.
+warnings.simplefilter("always", exceptions.SecurityWarning, append=True)
+# SubjectAltNameWarning's should go off once per host
+warnings.simplefilter("default", exceptions.SubjectAltNameWarning, append=True)
+# InsecurePlatformWarning's don't vary between requests, so we keep it default.
+warnings.simplefilter("default", exceptions.InsecurePlatformWarning, append=True)
+# SNIMissingWarnings should go off only once.
+warnings.simplefilter("default", exceptions.SNIMissingWarning, append=True)
+
+
+def disable_warnings(category=exceptions.HTTPWarning):
+    """
+    Helper for quickly disabling all urllib3 warnings.
+    """
+    warnings.simplefilter("ignore", category)
