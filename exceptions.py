@@ -1,57 +1,151 @@
-from __future__ import annotations
+"""
+requests.exceptions
+~~~~~~~~~~~~~~~~~~~
 
-from typing import TYPE_CHECKING, Collection, Generic
+This module contains the set of Requests' exceptions.
+"""
+from pip._vendor.urllib3.exceptions import HTTPError as BaseHTTPError
 
-from ..structs import CT, RT, RequirementInformation
-
-if TYPE_CHECKING:
-    from .criterion import Criterion
+from .compat import JSONDecodeError as CompatJSONDecodeError
 
 
-class ResolverException(Exception):
-    """A base class for all exceptions raised by this module.
+class RequestException(IOError):
+    """There was an ambiguous exception that occurred while handling your
+    request.
+    """
 
-    Exceptions derived by this class should all be handled in this module. Any
-    bubbling pass the resolver should be treated as a bug.
+    def __init__(self, *args, **kwargs):
+        """Initialize RequestException with `request` and `response` objects."""
+        response = kwargs.pop("response", None)
+        self.response = response
+        self.request = kwargs.pop("request", None)
+        if response is not None and not self.request and hasattr(response, "request"):
+            self.request = self.response.request
+        super().__init__(*args, **kwargs)
+
+
+class InvalidJSONError(RequestException):
+    """A JSON error occurred."""
+
+
+class JSONDecodeError(InvalidJSONError, CompatJSONDecodeError):
+    """Couldn't decode the text into json"""
+
+    def __init__(self, *args, **kwargs):
+        """
+        Construct the JSONDecodeError instance first with all
+        args. Then use it's args to construct the IOError so that
+        the json specific args aren't used as IOError specific args
+        and the error message from JSONDecodeError is preserved.
+        """
+        CompatJSONDecodeError.__init__(self, *args)
+        InvalidJSONError.__init__(self, *self.args, **kwargs)
+
+    def __reduce__(self):
+        """
+        The __reduce__ method called when pickling the object must
+        be the one from the JSONDecodeError (be it json/simplejson)
+        as it expects all the arguments for instantiation, not just
+        one like the IOError, and the MRO would by default call the
+        __reduce__ method from the IOError due to the inheritance order.
+        """
+        return CompatJSONDecodeError.__reduce__(self)
+
+
+class HTTPError(RequestException):
+    """An HTTP error occurred."""
+
+
+class ConnectionError(RequestException):
+    """A Connection error occurred."""
+
+
+class ProxyError(ConnectionError):
+    """A proxy error occurred."""
+
+
+class SSLError(ConnectionError):
+    """An SSL error occurred."""
+
+
+class Timeout(RequestException):
+    """The request timed out.
+
+    Catching this error will catch both
+    :exc:`~requests.exceptions.ConnectTimeout` and
+    :exc:`~requests.exceptions.ReadTimeout` errors.
     """
 
 
-class RequirementsConflicted(ResolverException, Generic[RT, CT]):
-    def __init__(self, criterion: Criterion[RT, CT]) -> None:
-        super().__init__(criterion)
-        self.criterion = criterion
+class ConnectTimeout(ConnectionError, Timeout):
+    """The request timed out while trying to connect to the remote server.
 
-    def __str__(self) -> str:
-        return "Requirements conflict: {}".format(
-            ", ".join(repr(r) for r in self.criterion.iter_requirement()),
-        )
+    Requests that produced this error are safe to retry.
+    """
 
 
-class InconsistentCandidate(ResolverException, Generic[RT, CT]):
-    def __init__(self, candidate: CT, criterion: Criterion[RT, CT]):
-        super().__init__(candidate, criterion)
-        self.candidate = candidate
-        self.criterion = criterion
-
-    def __str__(self) -> str:
-        return "Provided candidate {!r} does not satisfy {}".format(
-            self.candidate,
-            ", ".join(repr(r) for r in self.criterion.iter_requirement()),
-        )
+class ReadTimeout(Timeout):
+    """The server did not send any data in the allotted amount of time."""
 
 
-class ResolutionError(ResolverException):
-    pass
+class URLRequired(RequestException):
+    """A valid URL is required to make a request."""
 
 
-class ResolutionImpossible(ResolutionError, Generic[RT, CT]):
-    def __init__(self, causes: Collection[RequirementInformation[RT, CT]]):
-        super().__init__(causes)
-        # causes is a list of RequirementInformation objects
-        self.causes = causes
+class TooManyRedirects(RequestException):
+    """Too many redirects."""
 
 
-class ResolutionTooDeep(ResolutionError):
-    def __init__(self, round_count: int) -> None:
-        super().__init__(round_count)
-        self.round_count = round_count
+class MissingSchema(RequestException, ValueError):
+    """The URL scheme (e.g. http or https) is missing."""
+
+
+class InvalidSchema(RequestException, ValueError):
+    """The URL scheme provided is either invalid or unsupported."""
+
+
+class InvalidURL(RequestException, ValueError):
+    """The URL provided was somehow invalid."""
+
+
+class InvalidHeader(RequestException, ValueError):
+    """The header value provided was somehow invalid."""
+
+
+class InvalidProxyURL(InvalidURL):
+    """The proxy URL provided is invalid."""
+
+
+class ChunkedEncodingError(RequestException):
+    """The server declared chunked encoding but sent an invalid chunk."""
+
+
+class ContentDecodingError(RequestException, BaseHTTPError):
+    """Failed to decode response content."""
+
+
+class StreamConsumedError(RequestException, TypeError):
+    """The content for this response was already consumed."""
+
+
+class RetryError(RequestException):
+    """Custom retries logic failed"""
+
+
+class UnrewindableBodyError(RequestException):
+    """Requests encountered an error when trying to rewind a body."""
+
+
+# Warnings
+
+
+class RequestsWarning(Warning):
+    """Base warning for Requests."""
+
+
+class FileModeWarning(RequestsWarning, DeprecationWarning):
+    """A file was opened in text mode, but Requests determined its binary length."""
+
+
+class RequestsDependencyWarning(RequestsWarning):
+    """An imported dependency doesn't match the expected version range."""
