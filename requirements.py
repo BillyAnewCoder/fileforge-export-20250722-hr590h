@@ -1,91 +1,245 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
-from __future__ import annotations
+from typing import Any, Optional
 
-from typing import Any, Iterator
+from pip._vendor.packaging.specifiers import SpecifierSet
+from pip._vendor.packaging.utils import NormalizedName, canonicalize_name
 
-from ._parser import parse_requirement as _parse_requirement
-from ._tokenizer import ParserSyntaxError
-from .markers import Marker, _normalize_extra_values
-from .specifiers import SpecifierSet
-from .utils import canonicalize_name
+from pip._internal.req.constructors import install_req_drop_extras
+from pip._internal.req.req_install import InstallRequirement
+
+from .base import Candidate, CandidateLookup, Requirement, format_name
 
 
-class InvalidRequirement(ValueError):
-    """
-    An invalid requirement was found, users should refer to PEP 508.
-    """
-
-
-class Requirement:
-    """Parse a requirement.
-
-    Parse a given requirement string into its parts, such as name, specifier,
-    URL, and extras. Raises InvalidRequirement on a badly-formed requirement
-    string.
-    """
-
-    # TODO: Can we test whether something is contained within a requirement?
-    #       If so how do we do that? Do we need to test against the _name_ of
-    #       the thing as well as the version? What about the markers?
-    # TODO: Can we normalize the name and extra name?
-
-    def __init__(self, requirement_string: str) -> None:
-        try:
-            parsed = _parse_requirement(requirement_string)
-        except ParserSyntaxError as e:
-            raise InvalidRequirement(str(e)) from e
-
-        self.name: str = parsed.name
-        self.url: str | None = parsed.url or None
-        self.extras: set[str] = set(parsed.extras or [])
-        self.specifier: SpecifierSet = SpecifierSet(parsed.specifier)
-        self.marker: Marker | None = None
-        if parsed.marker is not None:
-            self.marker = Marker.__new__(Marker)
-            self.marker._markers = _normalize_extra_values(parsed.marker)
-
-    def _iter_parts(self, name: str) -> Iterator[str]:
-        yield name
-
-        if self.extras:
-            formatted_extras = ",".join(sorted(self.extras))
-            yield f"[{formatted_extras}]"
-
-        if self.specifier:
-            yield str(self.specifier)
-
-        if self.url:
-            yield f"@ {self.url}"
-            if self.marker:
-                yield " "
-
-        if self.marker:
-            yield f"; {self.marker}"
+class ExplicitRequirement(Requirement):
+    def __init__(self, candidate: Candidate) -> None:
+        self.candidate = candidate
 
     def __str__(self) -> str:
-        return "".join(self._iter_parts(self.name))
+        return str(self.candidate)
 
     def __repr__(self) -> str:
-        return f"<Requirement('{self}')>"
+        return f"{self.__class__.__name__}({self.candidate!r})"
 
     def __hash__(self) -> int:
-        return hash(
-            (
-                self.__class__.__name__,
-                *self._iter_parts(canonicalize_name(self.name)),
-            )
-        )
+        return hash(self.candidate)
 
     def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, Requirement):
-            return NotImplemented
+        if not isinstance(other, ExplicitRequirement):
+            return False
+        return self.candidate == other.candidate
 
-        return (
-            canonicalize_name(self.name) == canonicalize_name(other.name)
-            and self.extras == other.extras
-            and self.specifier == other.specifier
-            and self.url == other.url
-            and self.marker == other.marker
+    @property
+    def project_name(self) -> NormalizedName:
+        # No need to canonicalize - the candidate did this
+        return self.candidate.project_name
+
+    @property
+    def name(self) -> str:
+        # No need to canonicalize - the candidate did this
+        return self.candidate.name
+
+    def format_for_error(self) -> str:
+        return self.candidate.format_for_error()
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        return self.candidate, None
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        return candidate == self.candidate
+
+
+class SpecifierRequirement(Requirement):
+    def __init__(self, ireq: InstallRequirement) -> None:
+        assert ireq.link is None, "This is a link, not a specifier"
+        self._ireq = ireq
+        self._equal_cache: Optional[str] = None
+        self._hash: Optional[int] = None
+        self._extras = frozenset(canonicalize_name(e) for e in self._ireq.extras)
+
+    @property
+    def _equal(self) -> str:
+        if self._equal_cache is not None:
+            return self._equal_cache
+
+        self._equal_cache = str(self._ireq)
+        return self._equal_cache
+
+    def __str__(self) -> str:
+        return str(self._ireq.req)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({str(self._ireq.req)!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SpecifierRequirement):
+            return NotImplemented
+        return self._equal == other._equal
+
+    def __hash__(self) -> int:
+        if self._hash is not None:
+            return self._hash
+
+        self._hash = hash(self._equal)
+        return self._hash
+
+    @property
+    def project_name(self) -> NormalizedName:
+        assert self._ireq.req, "Specifier-backed ireq is always PEP 508"
+        return canonicalize_name(self._ireq.req.name)
+
+    @property
+    def name(self) -> str:
+        return format_name(self.project_name, self._extras)
+
+    def format_for_error(self) -> str:
+        # Convert comma-separated specifiers into "A, B, ..., F and G"
+        # This makes the specifier a bit more "human readable", without
+        # risking a change in meaning. (Hopefully! Not all edge cases have
+        # been checked)
+        parts = [s.strip() for s in str(self).split(",")]
+        if len(parts) == 0:
+            return ""
+        elif len(parts) == 1:
+            return parts[0]
+
+        return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        return None, self._ireq
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        assert candidate.name == self.name, (
+            f"Internal issue: Candidate is not for this requirement "
+            f"{candidate.name} vs {self.name}"
         )
+        # We can safely always allow prereleases here since PackageFinder
+        # already implements the prerelease logic, and would have filtered out
+        # prerelease candidates if the user does not expect them.
+        assert self._ireq.req, "Specifier-backed ireq is always PEP 508"
+        spec = self._ireq.req.specifier
+        return spec.contains(candidate.version, prereleases=True)
+
+
+class SpecifierWithoutExtrasRequirement(SpecifierRequirement):
+    """
+    Requirement backed by an install requirement on a base package.
+    Trims extras from its install requirement if there are any.
+    """
+
+    def __init__(self, ireq: InstallRequirement) -> None:
+        assert ireq.link is None, "This is a link, not a specifier"
+        self._ireq = install_req_drop_extras(ireq)
+        self._equal_cache: Optional[str] = None
+        self._hash: Optional[int] = None
+        self._extras = frozenset(canonicalize_name(e) for e in self._ireq.extras)
+
+    @property
+    def _equal(self) -> str:
+        if self._equal_cache is not None:
+            return self._equal_cache
+
+        self._equal_cache = str(self._ireq)
+        return self._equal_cache
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SpecifierWithoutExtrasRequirement):
+            return NotImplemented
+        return self._equal == other._equal
+
+    def __hash__(self) -> int:
+        if self._hash is not None:
+            return self._hash
+
+        self._hash = hash(self._equal)
+        return self._hash
+
+
+class RequiresPythonRequirement(Requirement):
+    """A requirement representing Requires-Python metadata."""
+
+    def __init__(self, specifier: SpecifierSet, match: Candidate) -> None:
+        self.specifier = specifier
+        self._specifier_string = str(specifier)  # for faster __eq__
+        self._hash: Optional[int] = None
+        self._candidate = match
+
+    def __str__(self) -> str:
+        return f"Python {self.specifier}"
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({str(self.specifier)!r})"
+
+    def __hash__(self) -> int:
+        if self._hash is not None:
+            return self._hash
+
+        self._hash = hash((self._specifier_string, self._candidate))
+        return self._hash
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, RequiresPythonRequirement):
+            return False
+        return (
+            self._specifier_string == other._specifier_string
+            and self._candidate == other._candidate
+        )
+
+    @property
+    def project_name(self) -> NormalizedName:
+        return self._candidate.project_name
+
+    @property
+    def name(self) -> str:
+        return self._candidate.name
+
+    def format_for_error(self) -> str:
+        return str(self)
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        if self.specifier.contains(self._candidate.version, prereleases=True):
+            return self._candidate, None
+        return None, None
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        assert candidate.name == self._candidate.name, "Not Python candidate"
+        # We can safely always allow prereleases here since PackageFinder
+        # already implements the prerelease logic, and would have filtered out
+        # prerelease candidates if the user does not expect them.
+        return self.specifier.contains(candidate.version, prereleases=True)
+
+
+class UnsatisfiableRequirement(Requirement):
+    """A requirement that cannot be satisfied."""
+
+    def __init__(self, name: NormalizedName) -> None:
+        self._name = name
+
+    def __str__(self) -> str:
+        return f"{self._name} (unavailable)"
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({str(self._name)!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, UnsatisfiableRequirement):
+            return NotImplemented
+        return self._name == other._name
+
+    def __hash__(self) -> int:
+        return hash(self._name)
+
+    @property
+    def project_name(self) -> NormalizedName:
+        return self._name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def format_for_error(self) -> str:
+        return str(self)
+
+    def get_candidate_lookup(self) -> CandidateLookup:
+        return None, None
+
+    def is_satisfied_by(self, candidate: Candidate) -> bool:
+        return False
