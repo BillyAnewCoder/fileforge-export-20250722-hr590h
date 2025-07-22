@@ -1,54 +1,33 @@
-from .distro import (
-    NORMALIZED_DISTRO_ID,
-    NORMALIZED_LSB_ID,
-    NORMALIZED_OS_ID,
-    LinuxDistribution,
-    __version__,
-    build_number,
-    codename,
-    distro_release_attr,
-    distro_release_info,
-    id,
-    info,
-    like,
-    linux_distribution,
-    lsb_release_attr,
-    lsb_release_info,
-    major_version,
-    minor_version,
-    name,
-    os_release_attr,
-    os_release_info,
-    uname_attr,
-    uname_info,
-    version,
-    version_parts,
-)
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2012-2023 Vinay Sajip.
+# Licensed to the Python Software Foundation under a contributor agreement.
+# See LICENSE.txt and CONTRIBUTORS.txt.
+#
+import logging
 
-__all__ = [
-    "NORMALIZED_DISTRO_ID",
-    "NORMALIZED_LSB_ID",
-    "NORMALIZED_OS_ID",
-    "LinuxDistribution",
-    "build_number",
-    "codename",
-    "distro_release_attr",
-    "distro_release_info",
-    "id",
-    "info",
-    "like",
-    "linux_distribution",
-    "lsb_release_attr",
-    "lsb_release_info",
-    "major_version",
-    "minor_version",
-    "name",
-    "os_release_attr",
-    "os_release_info",
-    "uname_attr",
-    "uname_info",
-    "version",
-    "version_parts",
-]
+__version__ = '0.3.9'
 
-__version__ = __version__
+
+class DistlibException(Exception):
+    pass
+
+
+try:
+    from logging import NullHandler
+except ImportError:  # pragma: no cover
+
+    class NullHandler(logging.Handler):
+
+        def handle(self, record):
+            pass
+
+        def emit(self, record):
+            pass
+
+        def createLock(self):
+            self.lock = None
+
+
+logger = logging.getLogger(__name__)
+logger.addHandler(NullHandler())
