@@ -1,582 +1,750 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2012-2023 The Python Software Foundation.
+# See LICENSE.txt and CONTRIBUTORS.txt.
+#
 """
-.. testsetup::
-
-    from pip._vendor.packaging.version import parse, Version
+Implementation of a flexible versioning scheme providing support for PEP-440,
+setuptools-compatible and semantic versioning.
 """
 
-from __future__ import annotations
-
-import itertools
+import logging
 import re
-from typing import Any, Callable, NamedTuple, SupportsInt, Tuple, Union
 
-from ._structures import Infinity, InfinityType, NegativeInfinity, NegativeInfinityType
+from .compat import string_types
+from .util import parse_requirement
 
-__all__ = ["VERSION_PATTERN", "InvalidVersion", "Version", "parse"]
+__all__ = ['NormalizedVersion', 'NormalizedMatcher',
+           'LegacyVersion', 'LegacyMatcher',
+           'SemanticVersion', 'SemanticMatcher',
+           'UnsupportedVersionError', 'get_scheme']
 
-LocalType = Tuple[Union[int, str], ...]
-
-CmpPrePostDevType = Union[InfinityType, NegativeInfinityType, Tuple[str, int]]
-CmpLocalType = Union[
-    NegativeInfinityType,
-    Tuple[Union[Tuple[int, str], Tuple[NegativeInfinityType, Union[int, str]]], ...],
-]
-CmpKey = Tuple[
-    int,
-    Tuple[int, ...],
-    CmpPrePostDevType,
-    CmpPrePostDevType,
-    CmpPrePostDevType,
-    CmpLocalType,
-]
-VersionComparisonMethod = Callable[[CmpKey, CmpKey], bool]
+logger = logging.getLogger(__name__)
 
 
-class _Version(NamedTuple):
-    epoch: int
-    release: tuple[int, ...]
-    dev: tuple[str, int] | None
-    pre: tuple[str, int] | None
-    post: tuple[str, int] | None
-    local: LocalType | None
+class UnsupportedVersionError(ValueError):
+    """This is an unsupported version."""
+    pass
 
 
-def parse(version: str) -> Version:
-    """Parse the given version string.
+class Version(object):
+    def __init__(self, s):
+        self._string = s = s.strip()
+        self._parts = parts = self.parse(s)
+        assert isinstance(parts, tuple)
+        assert len(parts) > 0
 
-    >>> parse('1.0.dev1')
-    <Version('1.0.dev1')>
+    def parse(self, s):
+        raise NotImplementedError('please implement in a subclass')
 
-    :param version: The version string to parse.
-    :raises InvalidVersion: When the version string is not a valid version.
-    """
-    return Version(version)
+    def _check_compatible(self, other):
+        if type(self) != type(other):
+            raise TypeError('cannot compare %r and %r' % (self, other))
 
+    def __eq__(self, other):
+        self._check_compatible(other)
+        return self._parts == other._parts
 
-class InvalidVersion(ValueError):
-    """Raised when a version string is not a valid version.
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
-    >>> Version("invalid")
-    Traceback (most recent call last):
-        ...
-    packaging.version.InvalidVersion: Invalid version: 'invalid'
-    """
+    def __lt__(self, other):
+        self._check_compatible(other)
+        return self._parts < other._parts
 
+    def __gt__(self, other):
+        return not (self.__lt__(other) or self.__eq__(other))
 
-class _BaseVersion:
-    _key: tuple[Any, ...]
+    def __le__(self, other):
+        return self.__lt__(other) or self.__eq__(other)
 
-    def __hash__(self) -> int:
-        return hash(self._key)
+    def __ge__(self, other):
+        return self.__gt__(other) or self.__eq__(other)
 
-    # Please keep the duplicated `isinstance` check
-    # in the six comparisons hereunder
-    # unless you find a way to avoid adding overhead function calls.
-    def __lt__(self, other: _BaseVersion) -> bool:
-        if not isinstance(other, _BaseVersion):
-            return NotImplemented
+    # See http://docs.python.org/reference/datamodel#object.__hash__
+    def __hash__(self):
+        return hash(self._parts)
 
-        return self._key < other._key
+    def __repr__(self):
+        return "%s('%s')" % (self.__class__.__name__, self._string)
 
-    def __le__(self, other: _BaseVersion) -> bool:
-        if not isinstance(other, _BaseVersion):
-            return NotImplemented
-
-        return self._key <= other._key
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, _BaseVersion):
-            return NotImplemented
-
-        return self._key == other._key
-
-    def __ge__(self, other: _BaseVersion) -> bool:
-        if not isinstance(other, _BaseVersion):
-            return NotImplemented
-
-        return self._key >= other._key
-
-    def __gt__(self, other: _BaseVersion) -> bool:
-        if not isinstance(other, _BaseVersion):
-            return NotImplemented
-
-        return self._key > other._key
-
-    def __ne__(self, other: object) -> bool:
-        if not isinstance(other, _BaseVersion):
-            return NotImplemented
-
-        return self._key != other._key
-
-
-# Deliberately not anchored to the start and end of the string, to make it
-# easier for 3rd party code to reuse
-_VERSION_PATTERN = r"""
-    v?
-    (?:
-        (?:(?P<epoch>[0-9]+)!)?                           # epoch
-        (?P<release>[0-9]+(?:\.[0-9]+)*)                  # release segment
-        (?P<pre>                                          # pre-release
-            [-_\.]?
-            (?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)
-            [-_\.]?
-            (?P<pre_n>[0-9]+)?
-        )?
-        (?P<post>                                         # post release
-            (?:-(?P<post_n1>[0-9]+))
-            |
-            (?:
-                [-_\.]?
-                (?P<post_l>post|rev|r)
-                [-_\.]?
-                (?P<post_n2>[0-9]+)?
-            )
-        )?
-        (?P<dev>                                          # dev release
-            [-_\.]?
-            (?P<dev_l>dev)
-            [-_\.]?
-            (?P<dev_n>[0-9]+)?
-        )?
-    )
-    (?:\+(?P<local>[a-z0-9]+(?:[-_\.][a-z0-9]+)*))?       # local version
-"""
-
-VERSION_PATTERN = _VERSION_PATTERN
-"""
-A string containing the regular expression used to match a valid version.
-
-The pattern is not anchored at either end, and is intended for embedding in larger
-expressions (for example, matching a version number as part of a file name). The
-regular expression should be compiled with the ``re.VERBOSE`` and ``re.IGNORECASE``
-flags set.
-
-:meta hide-value:
-"""
-
-
-class Version(_BaseVersion):
-    """This class abstracts handling of a project's versions.
-
-    A :class:`Version` instance is comparison aware and can be compared and
-    sorted using the standard Python interfaces.
-
-    >>> v1 = Version("1.0a5")
-    >>> v2 = Version("1.0")
-    >>> v1
-    <Version('1.0a5')>
-    >>> v2
-    <Version('1.0')>
-    >>> v1 < v2
-    True
-    >>> v1 == v2
-    False
-    >>> v1 > v2
-    False
-    >>> v1 >= v2
-    False
-    >>> v1 <= v2
-    True
-    """
-
-    _regex = re.compile(r"^\s*" + VERSION_PATTERN + r"\s*$", re.VERBOSE | re.IGNORECASE)
-    _key: CmpKey
-
-    def __init__(self, version: str) -> None:
-        """Initialize a Version object.
-
-        :param version:
-            The string representation of a version which will be parsed and normalized
-            before use.
-        :raises InvalidVersion:
-            If the ``version`` does not conform to PEP 440 in any way then this
-            exception will be raised.
-        """
-
-        # Validate the version and parse it into pieces
-        match = self._regex.search(version)
-        if not match:
-            raise InvalidVersion(f"Invalid version: {version!r}")
-
-        # Store the parsed out pieces of the version
-        self._version = _Version(
-            epoch=int(match.group("epoch")) if match.group("epoch") else 0,
-            release=tuple(int(i) for i in match.group("release").split(".")),
-            pre=_parse_letter_version(match.group("pre_l"), match.group("pre_n")),
-            post=_parse_letter_version(
-                match.group("post_l"), match.group("post_n1") or match.group("post_n2")
-            ),
-            dev=_parse_letter_version(match.group("dev_l"), match.group("dev_n")),
-            local=_parse_local_version(match.group("local")),
-        )
-
-        # Generate a key which will be used for sorting
-        self._key = _cmpkey(
-            self._version.epoch,
-            self._version.release,
-            self._version.pre,
-            self._version.post,
-            self._version.dev,
-            self._version.local,
-        )
-
-    def __repr__(self) -> str:
-        """A representation of the Version that shows all internal state.
-
-        >>> Version('1.0.0')
-        <Version('1.0.0')>
-        """
-        return f"<Version('{self}')>"
-
-    def __str__(self) -> str:
-        """A string representation of the version that can be round-tripped.
-
-        >>> str(Version("1.0a5"))
-        '1.0a5'
-        """
-        parts = []
-
-        # Epoch
-        if self.epoch != 0:
-            parts.append(f"{self.epoch}!")
-
-        # Release segment
-        parts.append(".".join(str(x) for x in self.release))
-
-        # Pre-release
-        if self.pre is not None:
-            parts.append("".join(str(x) for x in self.pre))
-
-        # Post-release
-        if self.post is not None:
-            parts.append(f".post{self.post}")
-
-        # Development release
-        if self.dev is not None:
-            parts.append(f".dev{self.dev}")
-
-        # Local version segment
-        if self.local is not None:
-            parts.append(f"+{self.local}")
-
-        return "".join(parts)
+    def __str__(self):
+        return self._string
 
     @property
-    def epoch(self) -> int:
-        """The epoch of the version.
+    def is_prerelease(self):
+        raise NotImplementedError('Please implement in subclasses.')
 
-        >>> Version("2.0.0").epoch
-        0
-        >>> Version("1!2.0.0").epoch
-        1
+
+class Matcher(object):
+    version_class = None
+
+    # value is either a callable or the name of a method
+    _operators = {
+        '<': lambda v, c, p: v < c,
+        '>': lambda v, c, p: v > c,
+        '<=': lambda v, c, p: v == c or v < c,
+        '>=': lambda v, c, p: v == c or v > c,
+        '==': lambda v, c, p: v == c,
+        '===': lambda v, c, p: v == c,
+        # by default, compatible => >=.
+        '~=': lambda v, c, p: v == c or v > c,
+        '!=': lambda v, c, p: v != c,
+    }
+
+    # this is a method only to support alternative implementations
+    # via overriding
+    def parse_requirement(self, s):
+        return parse_requirement(s)
+
+    def __init__(self, s):
+        if self.version_class is None:
+            raise ValueError('Please specify a version class')
+        self._string = s = s.strip()
+        r = self.parse_requirement(s)
+        if not r:
+            raise ValueError('Not valid: %r' % s)
+        self.name = r.name
+        self.key = self.name.lower()    # for case-insensitive comparisons
+        clist = []
+        if r.constraints:
+            # import pdb; pdb.set_trace()
+            for op, s in r.constraints:
+                if s.endswith('.*'):
+                    if op not in ('==', '!='):
+                        raise ValueError('\'.*\' not allowed for '
+                                         '%r constraints' % op)
+                    # Could be a partial version (e.g. for '2.*') which
+                    # won't parse as a version, so keep it as a string
+                    vn, prefix = s[:-2], True
+                    # Just to check that vn is a valid version
+                    self.version_class(vn)
+                else:
+                    # Should parse as a version, so we can create an
+                    # instance for the comparison
+                    vn, prefix = self.version_class(s), False
+                clist.append((op, vn, prefix))
+        self._parts = tuple(clist)
+
+    def match(self, version):
         """
-        return self._version.epoch
+        Check if the provided version matches the constraints.
+
+        :param version: The version to match against this instance.
+        :type version: String or :class:`Version` instance.
+        """
+        if isinstance(version, string_types):
+            version = self.version_class(version)
+        for operator, constraint, prefix in self._parts:
+            f = self._operators.get(operator)
+            if isinstance(f, string_types):
+                f = getattr(self, f)
+            if not f:
+                msg = ('%r not implemented '
+                       'for %s' % (operator, self.__class__.__name__))
+                raise NotImplementedError(msg)
+            if not f(version, constraint, prefix):
+                return False
+        return True
 
     @property
-    def release(self) -> tuple[int, ...]:
-        """The components of the "release" segment of the version.
+    def exact_version(self):
+        result = None
+        if len(self._parts) == 1 and self._parts[0][0] in ('==', '==='):
+            result = self._parts[0][1]
+        return result
 
-        >>> Version("1.2.3").release
-        (1, 2, 3)
-        >>> Version("2.0.0").release
-        (2, 0, 0)
-        >>> Version("1!2.0.0.post0").release
-        (2, 0, 0)
+    def _check_compatible(self, other):
+        if type(self) != type(other) or self.name != other.name:
+            raise TypeError('cannot compare %s and %s' % (self, other))
 
-        Includes trailing zeroes but not the epoch or any pre-release / development /
-        post-release suffixes.
-        """
-        return self._version.release
+    def __eq__(self, other):
+        self._check_compatible(other)
+        return self.key == other.key and self._parts == other._parts
 
-    @property
-    def pre(self) -> tuple[str, int] | None:
-        """The pre-release segment of the version.
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
-        >>> print(Version("1.2.3").pre)
-        None
-        >>> Version("1.2.3a1").pre
-        ('a', 1)
-        >>> Version("1.2.3b1").pre
-        ('b', 1)
-        >>> Version("1.2.3rc1").pre
-        ('rc', 1)
-        """
-        return self._version.pre
+    # See http://docs.python.org/reference/datamodel#object.__hash__
+    def __hash__(self):
+        return hash(self.key) + hash(self._parts)
 
-    @property
-    def post(self) -> int | None:
-        """The post-release number of the version.
+    def __repr__(self):
+        return "%s(%r)" % (self.__class__.__name__, self._string)
 
-        >>> print(Version("1.2.3").post)
-        None
-        >>> Version("1.2.3.post1").post
-        1
-        """
-        return self._version.post[1] if self._version.post else None
+    def __str__(self):
+        return self._string
 
-    @property
-    def dev(self) -> int | None:
-        """The development number of the version.
 
-        >>> print(Version("1.2.3").dev)
-        None
-        >>> Version("1.2.3.dev1").dev
-        1
-        """
-        return self._version.dev[1] if self._version.dev else None
+PEP440_VERSION_RE = re.compile(r'^v?(\d+!)?(\d+(\.\d+)*)((a|alpha|b|beta|c|rc|pre|preview)(\d+)?)?'
+                               r'(\.(post|r|rev)(\d+)?)?([._-]?(dev)(\d+)?)?'
+                               r'(\+([a-zA-Z\d]+(\.[a-zA-Z\d]+)?))?$', re.I)
 
-    @property
-    def local(self) -> str | None:
-        """The local version segment of the version.
 
-        >>> print(Version("1.2.3").local)
-        None
-        >>> Version("1.2.3+abc").local
-        'abc'
-        """
-        if self._version.local:
-            return ".".join(str(x) for x in self._version.local)
+def _pep_440_key(s):
+    s = s.strip()
+    m = PEP440_VERSION_RE.match(s)
+    if not m:
+        raise UnsupportedVersionError('Not a valid version: %s' % s)
+    groups = m.groups()
+    nums = tuple(int(v) for v in groups[1].split('.'))
+    while len(nums) > 1 and nums[-1] == 0:
+        nums = nums[:-1]
+
+    if not groups[0]:
+        epoch = 0
+    else:
+        epoch = int(groups[0][:-1])
+    pre = groups[4:6]
+    post = groups[7:9]
+    dev = groups[10:12]
+    local = groups[13]
+    if pre == (None, None):
+        pre = ()
+    else:
+        if pre[1] is None:
+            pre = pre[0], 0
         else:
-            return None
-
-    @property
-    def public(self) -> str:
-        """The public portion of the version.
-
-        >>> Version("1.2.3").public
-        '1.2.3'
-        >>> Version("1.2.3+abc").public
-        '1.2.3'
-        >>> Version("1!1.2.3dev1+abc").public
-        '1!1.2.3.dev1'
-        """
-        return str(self).split("+", 1)[0]
-
-    @property
-    def base_version(self) -> str:
-        """The "base version" of the version.
-
-        >>> Version("1.2.3").base_version
-        '1.2.3'
-        >>> Version("1.2.3+abc").base_version
-        '1.2.3'
-        >>> Version("1!1.2.3dev1+abc").base_version
-        '1!1.2.3'
-
-        The "base version" is the public version of the project without any pre or post
-        release markers.
-        """
-        parts = []
-
-        # Epoch
-        if self.epoch != 0:
-            parts.append(f"{self.epoch}!")
-
-        # Release segment
-        parts.append(".".join(str(x) for x in self.release))
-
-        return "".join(parts)
-
-    @property
-    def is_prerelease(self) -> bool:
-        """Whether this version is a pre-release.
-
-        >>> Version("1.2.3").is_prerelease
-        False
-        >>> Version("1.2.3a1").is_prerelease
-        True
-        >>> Version("1.2.3b1").is_prerelease
-        True
-        >>> Version("1.2.3rc1").is_prerelease
-        True
-        >>> Version("1.2.3dev1").is_prerelease
-        True
-        """
-        return self.dev is not None or self.pre is not None
-
-    @property
-    def is_postrelease(self) -> bool:
-        """Whether this version is a post-release.
-
-        >>> Version("1.2.3").is_postrelease
-        False
-        >>> Version("1.2.3.post1").is_postrelease
-        True
-        """
-        return self.post is not None
-
-    @property
-    def is_devrelease(self) -> bool:
-        """Whether this version is a development release.
-
-        >>> Version("1.2.3").is_devrelease
-        False
-        >>> Version("1.2.3.dev1").is_devrelease
-        True
-        """
-        return self.dev is not None
-
-    @property
-    def major(self) -> int:
-        """The first item of :attr:`release` or ``0`` if unavailable.
-
-        >>> Version("1.2.3").major
-        1
-        """
-        return self.release[0] if len(self.release) >= 1 else 0
-
-    @property
-    def minor(self) -> int:
-        """The second item of :attr:`release` or ``0`` if unavailable.
-
-        >>> Version("1.2.3").minor
-        2
-        >>> Version("1").minor
-        0
-        """
-        return self.release[1] if len(self.release) >= 2 else 0
-
-    @property
-    def micro(self) -> int:
-        """The third item of :attr:`release` or ``0`` if unavailable.
-
-        >>> Version("1.2.3").micro
-        3
-        >>> Version("1").micro
-        0
-        """
-        return self.release[2] if len(self.release) >= 3 else 0
-
-
-class _TrimmedRelease(Version):
-    @property
-    def release(self) -> tuple[int, ...]:
-        """
-        Release segment without any trailing zeros.
-
-        >>> _TrimmedRelease('1.0.0').release
-        (1,)
-        >>> _TrimmedRelease('0.0').release
-        (0,)
-        """
-        rel = super().release
-        nonzeros = (index for index, val in enumerate(rel) if val)
-        last_nonzero = max(nonzeros, default=0)
-        return rel[: last_nonzero + 1]
-
-
-def _parse_letter_version(
-    letter: str | None, number: str | bytes | SupportsInt | None
-) -> tuple[str, int] | None:
-    if letter:
-        # We consider there to be an implicit 0 in a pre-release if there is
-        # not a numeral associated with it.
-        if number is None:
-            number = 0
-
-        # We normalize any letters to their lower case form
-        letter = letter.lower()
-
-        # We consider some words to be alternate spellings of other words and
-        # in those cases we want to normalize the spellings to our preferred
-        # spelling.
-        if letter == "alpha":
-            letter = "a"
-        elif letter == "beta":
-            letter = "b"
-        elif letter in ["c", "pre", "preview"]:
-            letter = "rc"
-        elif letter in ["rev", "r"]:
-            letter = "post"
-
-        return letter, int(number)
-
-    assert not letter
-    if number:
-        # We assume if we are given a number, but we are not given a letter
-        # then this is using the implicit post release syntax (e.g. 1.0-1)
-        letter = "post"
-
-        return letter, int(number)
-
-    return None
-
-
-_local_version_separators = re.compile(r"[\._-]")
-
-
-def _parse_local_version(local: str | None) -> LocalType | None:
-    """
-    Takes a string like abc.1.twelve and turns it into ("abc", 1, "twelve").
-    """
-    if local is not None:
-        return tuple(
-            part.lower() if not part.isdigit() else int(part)
-            for part in _local_version_separators.split(local)
-        )
-    return None
-
-
-def _cmpkey(
-    epoch: int,
-    release: tuple[int, ...],
-    pre: tuple[str, int] | None,
-    post: tuple[str, int] | None,
-    dev: tuple[str, int] | None,
-    local: LocalType | None,
-) -> CmpKey:
-    # When we compare a release version, we want to compare it with all of the
-    # trailing zeros removed. So we'll use a reverse the list, drop all the now
-    # leading zeros until we come to something non zero, then take the rest
-    # re-reverse it back into the correct order and make it a tuple and use
-    # that for our sorting key.
-    _release = tuple(
-        reversed(list(itertools.dropwhile(lambda x: x == 0, reversed(release))))
-    )
-
-    # We need to "trick" the sorting algorithm to put 1.0.dev0 before 1.0a0.
-    # We'll do this by abusing the pre segment, but we _only_ want to do this
-    # if there is not a pre or a post segment. If we have one of those then
-    # the normal sorting rules will handle this case correctly.
-    if pre is None and post is None and dev is not None:
-        _pre: CmpPrePostDevType = NegativeInfinity
-    # Versions without a pre-release (except as noted above) should sort after
-    # those with one.
-    elif pre is None:
-        _pre = Infinity
+            pre = pre[0], int(pre[1])
+    if post == (None, None):
+        post = ()
     else:
-        _pre = pre
-
-    # Versions without a post segment should sort before those with one.
-    if post is None:
-        _post: CmpPrePostDevType = NegativeInfinity
-
+        if post[1] is None:
+            post = post[0], 0
+        else:
+            post = post[0], int(post[1])
+    if dev == (None, None):
+        dev = ()
     else:
-        _post = post
-
-    # Versions without a development segment should sort after those with one.
-    if dev is None:
-        _dev: CmpPrePostDevType = Infinity
-
-    else:
-        _dev = dev
-
+        if dev[1] is None:
+            dev = dev[0], 0
+        else:
+            dev = dev[0], int(dev[1])
     if local is None:
-        # Versions without a local segment should sort before those with one.
-        _local: CmpLocalType = NegativeInfinity
+        local = ()
     else:
-        # Versions with a local segment need that segment parsed to implement
-        # the sorting rules in PEP440.
-        # - Alpha numeric segments sort before numeric segments
-        # - Alpha numeric segments sort lexicographically
-        # - Numeric segments sort numerically
-        # - Shorter versions sort before longer versions when the prefixes
-        #   match exactly
-        _local = tuple(
-            (i, "") if isinstance(i, int) else (NegativeInfinity, i) for i in local
-        )
+        parts = []
+        for part in local.split('.'):
+            # to ensure that numeric compares as > lexicographic, avoid
+            # comparing them directly, but encode a tuple which ensures
+            # correct sorting
+            if part.isdigit():
+                part = (1, int(part))
+            else:
+                part = (0, part)
+            parts.append(part)
+        local = tuple(parts)
+    if not pre:
+        # either before pre-release, or final release and after
+        if not post and dev:
+            # before pre-release
+            pre = ('a', -1)     # to sort before a0
+        else:
+            pre = ('z',)        # to sort after all pre-releases
+    # now look at the state of post and dev.
+    if not post:
+        post = ('_',)   # sort before 'a'
+    if not dev:
+        dev = ('final',)
 
-    return epoch, _release, _pre, _post, _dev, _local
+    return epoch, nums, pre, post, dev, local
+
+
+_normalized_key = _pep_440_key
+
+
+class NormalizedVersion(Version):
+    """A rational version.
+
+    Good:
+        1.2         # equivalent to "1.2.0"
+        1.2.0
+        1.2a1
+        1.2.3a2
+        1.2.3b1
+        1.2.3c1
+        1.2.3.4
+        TODO: fill this out
+
+    Bad:
+        1           # minimum two numbers
+        1.2a        # release level must have a release serial
+        1.2.3b
+    """
+    def parse(self, s):
+        result = _normalized_key(s)
+        # _normalized_key loses trailing zeroes in the release
+        # clause, since that's needed to ensure that X.Y == X.Y.0 == X.Y.0.0
+        # However, PEP 440 prefix matching needs it: for example,
+        # (~= 1.4.5.0) matches differently to (~= 1.4.5.0.0).
+        m = PEP440_VERSION_RE.match(s)      # must succeed
+        groups = m.groups()
+        self._release_clause = tuple(int(v) for v in groups[1].split('.'))
+        return result
+
+    PREREL_TAGS = set(['a', 'b', 'c', 'rc', 'dev'])
+
+    @property
+    def is_prerelease(self):
+        return any(t[0] in self.PREREL_TAGS for t in self._parts if t)
+
+
+def _match_prefix(x, y):
+    x = str(x)
+    y = str(y)
+    if x == y:
+        return True
+    if not x.startswith(y):
+        return False
+    n = len(y)
+    return x[n] == '.'
+
+
+class NormalizedMatcher(Matcher):
+    version_class = NormalizedVersion
+
+    # value is either a callable or the name of a method
+    _operators = {
+        '~=': '_match_compatible',
+        '<': '_match_lt',
+        '>': '_match_gt',
+        '<=': '_match_le',
+        '>=': '_match_ge',
+        '==': '_match_eq',
+        '===': '_match_arbitrary',
+        '!=': '_match_ne',
+    }
+
+    def _adjust_local(self, version, constraint, prefix):
+        if prefix:
+            strip_local = '+' not in constraint and version._parts[-1]
+        else:
+            # both constraint and version are
+            # NormalizedVersion instances.
+            # If constraint does not have a local component,
+            # ensure the version doesn't, either.
+            strip_local = not constraint._parts[-1] and version._parts[-1]
+        if strip_local:
+            s = version._string.split('+', 1)[0]
+            version = self.version_class(s)
+        return version, constraint
+
+    def _match_lt(self, version, constraint, prefix):
+        version, constraint = self._adjust_local(version, constraint, prefix)
+        if version >= constraint:
+            return False
+        release_clause = constraint._release_clause
+        pfx = '.'.join([str(i) for i in release_clause])
+        return not _match_prefix(version, pfx)
+
+    def _match_gt(self, version, constraint, prefix):
+        version, constraint = self._adjust_local(version, constraint, prefix)
+        if version <= constraint:
+            return False
+        release_clause = constraint._release_clause
+        pfx = '.'.join([str(i) for i in release_clause])
+        return not _match_prefix(version, pfx)
+
+    def _match_le(self, version, constraint, prefix):
+        version, constraint = self._adjust_local(version, constraint, prefix)
+        return version <= constraint
+
+    def _match_ge(self, version, constraint, prefix):
+        version, constraint = self._adjust_local(version, constraint, prefix)
+        return version >= constraint
+
+    def _match_eq(self, version, constraint, prefix):
+        version, constraint = self._adjust_local(version, constraint, prefix)
+        if not prefix:
+            result = (version == constraint)
+        else:
+            result = _match_prefix(version, constraint)
+        return result
+
+    def _match_arbitrary(self, version, constraint, prefix):
+        return str(version) == str(constraint)
+
+    def _match_ne(self, version, constraint, prefix):
+        version, constraint = self._adjust_local(version, constraint, prefix)
+        if not prefix:
+            result = (version != constraint)
+        else:
+            result = not _match_prefix(version, constraint)
+        return result
+
+    def _match_compatible(self, version, constraint, prefix):
+        version, constraint = self._adjust_local(version, constraint, prefix)
+        if version == constraint:
+            return True
+        if version < constraint:
+            return False
+#        if not prefix:
+#            return True
+        release_clause = constraint._release_clause
+        if len(release_clause) > 1:
+            release_clause = release_clause[:-1]
+        pfx = '.'.join([str(i) for i in release_clause])
+        return _match_prefix(version, pfx)
+
+
+_REPLACEMENTS = (
+    (re.compile('[.+-]$'), ''),                     # remove trailing puncts
+    (re.compile(r'^[.](\d)'), r'0.\1'),             # .N -> 0.N at start
+    (re.compile('^[.-]'), ''),                      # remove leading puncts
+    (re.compile(r'^\((.*)\)$'), r'\1'),             # remove parentheses
+    (re.compile(r'^v(ersion)?\s*(\d+)'), r'\2'),    # remove leading v(ersion)
+    (re.compile(r'^r(ev)?\s*(\d+)'), r'\2'),        # remove leading v(ersion)
+    (re.compile('[.]{2,}'), '.'),                   # multiple runs of '.'
+    (re.compile(r'\b(alfa|apha)\b'), 'alpha'),      # misspelt alpha
+    (re.compile(r'\b(pre-alpha|prealpha)\b'),
+        'pre.alpha'),                               # standardise
+    (re.compile(r'\(beta\)$'), 'beta'),             # remove parentheses
+)
+
+_SUFFIX_REPLACEMENTS = (
+    (re.compile('^[:~._+-]+'), ''),                   # remove leading puncts
+    (re.compile('[,*")([\\]]'), ''),                  # remove unwanted chars
+    (re.compile('[~:+_ -]'), '.'),                    # replace illegal chars
+    (re.compile('[.]{2,}'), '.'),                   # multiple runs of '.'
+    (re.compile(r'\.$'), ''),                       # trailing '.'
+)
+
+_NUMERIC_PREFIX = re.compile(r'(\d+(\.\d+)*)')
+
+
+def _suggest_semantic_version(s):
+    """
+    Try to suggest a semantic form for a version for which
+    _suggest_normalized_version couldn't come up with anything.
+    """
+    result = s.strip().lower()
+    for pat, repl in _REPLACEMENTS:
+        result = pat.sub(repl, result)
+    if not result:
+        result = '0.0.0'
+
+    # Now look for numeric prefix, and separate it out from
+    # the rest.
+    # import pdb; pdb.set_trace()
+    m = _NUMERIC_PREFIX.match(result)
+    if not m:
+        prefix = '0.0.0'
+        suffix = result
+    else:
+        prefix = m.groups()[0].split('.')
+        prefix = [int(i) for i in prefix]
+        while len(prefix) < 3:
+            prefix.append(0)
+        if len(prefix) == 3:
+            suffix = result[m.end():]
+        else:
+            suffix = '.'.join([str(i) for i in prefix[3:]]) + result[m.end():]
+            prefix = prefix[:3]
+        prefix = '.'.join([str(i) for i in prefix])
+        suffix = suffix.strip()
+    if suffix:
+        # import pdb; pdb.set_trace()
+        # massage the suffix.
+        for pat, repl in _SUFFIX_REPLACEMENTS:
+            suffix = pat.sub(repl, suffix)
+
+    if not suffix:
+        result = prefix
+    else:
+        sep = '-' if 'dev' in suffix else '+'
+        result = prefix + sep + suffix
+    if not is_semver(result):
+        result = None
+    return result
+
+
+def _suggest_normalized_version(s):
+    """Suggest a normalized version close to the given version string.
+
+    If you have a version string that isn't rational (i.e. NormalizedVersion
+    doesn't like it) then you might be able to get an equivalent (or close)
+    rational version from this function.
+
+    This does a number of simple normalizations to the given string, based
+    on observation of versions currently in use on PyPI. Given a dump of
+    those version during PyCon 2009, 4287 of them:
+    - 2312 (53.93%) match NormalizedVersion without change
+      with the automatic suggestion
+    - 3474 (81.04%) match when using this suggestion method
+
+    @param s {str} An irrational version string.
+    @returns A rational version string, or None, if couldn't determine one.
+    """
+    try:
+        _normalized_key(s)
+        return s   # already rational
+    except UnsupportedVersionError:
+        pass
+
+    rs = s.lower()
+
+    # part of this could use maketrans
+    for orig, repl in (('-alpha', 'a'), ('-beta', 'b'), ('alpha', 'a'),
+                       ('beta', 'b'), ('rc', 'c'), ('-final', ''),
+                       ('-pre', 'c'),
+                       ('-release', ''), ('.release', ''), ('-stable', ''),
+                       ('+', '.'), ('_', '.'), (' ', ''), ('.final', ''),
+                       ('final', '')):
+        rs = rs.replace(orig, repl)
+
+    # if something ends with dev or pre, we add a 0
+    rs = re.sub(r"pre$", r"pre0", rs)
+    rs = re.sub(r"dev$", r"dev0", rs)
+
+    # if we have something like "b-2" or "a.2" at the end of the
+    # version, that is probably beta, alpha, etc
+    # let's remove the dash or dot
+    rs = re.sub(r"([abc]|rc)[\-\.](\d+)$", r"\1\2", rs)
+
+    # 1.0-dev-r371 -> 1.0.dev371
+    # 0.1-dev-r79 -> 0.1.dev79
+    rs = re.sub(r"[\-\.](dev)[\-\.]?r?(\d+)$", r".\1\2", rs)
+
+    # Clean: 2.0.a.3, 2.0.b1, 0.9.0~c1
+    rs = re.sub(r"[.~]?([abc])\.?", r"\1", rs)
+
+    # Clean: v0.3, v1.0
+    if rs.startswith('v'):
+        rs = rs[1:]
+
+    # Clean leading '0's on numbers.
+    # TODO: unintended side-effect on, e.g., "2003.05.09"
+    # PyPI stats: 77 (~2%) better
+    rs = re.sub(r"\b0+(\d+)(?!\d)", r"\1", rs)
+
+    # Clean a/b/c with no version. E.g. "1.0a" -> "1.0a0". Setuptools infers
+    # zero.
+    # PyPI stats: 245 (7.56%) better
+    rs = re.sub(r"(\d+[abc])$", r"\g<1>0", rs)
+
+    # the 'dev-rNNN' tag is a dev tag
+    rs = re.sub(r"\.?(dev-r|dev\.r)\.?(\d+)$", r".dev\2", rs)
+
+    # clean the - when used as a pre delimiter
+    rs = re.sub(r"-(a|b|c)(\d+)$", r"\1\2", rs)
+
+    # a terminal "dev" or "devel" can be changed into ".dev0"
+    rs = re.sub(r"[\.\-](dev|devel)$", r".dev0", rs)
+
+    # a terminal "dev" can be changed into ".dev0"
+    rs = re.sub(r"(?![\.\-])dev$", r".dev0", rs)
+
+    # a terminal "final" or "stable" can be removed
+    rs = re.sub(r"(final|stable)$", "", rs)
+
+    # The 'r' and the '-' tags are post release tags
+    #   0.4a1.r10       ->  0.4a1.post10
+    #   0.9.33-17222    ->  0.9.33.post17222
+    #   0.9.33-r17222   ->  0.9.33.post17222
+    rs = re.sub(r"\.?(r|-|-r)\.?(\d+)$", r".post\2", rs)
+
+    # Clean 'r' instead of 'dev' usage:
+    #   0.9.33+r17222   ->  0.9.33.dev17222
+    #   1.0dev123       ->  1.0.dev123
+    #   1.0.git123      ->  1.0.dev123
+    #   1.0.bzr123      ->  1.0.dev123
+    #   0.1a0dev.123    ->  0.1a0.dev123
+    # PyPI stats:  ~150 (~4%) better
+    rs = re.sub(r"\.?(dev|git|bzr)\.?(\d+)$", r".dev\2", rs)
+
+    # Clean '.pre' (normalized from '-pre' above) instead of 'c' usage:
+    #   0.2.pre1        ->  0.2c1
+    #   0.2-c1         ->  0.2c1
+    #   1.0preview123   ->  1.0c123
+    # PyPI stats: ~21 (0.62%) better
+    rs = re.sub(r"\.?(pre|preview|-c)(\d+)$", r"c\g<2>", rs)
+
+    # Tcl/Tk uses "px" for their post release markers
+    rs = re.sub(r"p(\d+)$", r".post\1", rs)
+
+    try:
+        _normalized_key(rs)
+    except UnsupportedVersionError:
+        rs = None
+    return rs
+
+#
+#   Legacy version processing (distribute-compatible)
+#
+
+
+_VERSION_PART = re.compile(r'([a-z]+|\d+|[\.-])', re.I)
+_VERSION_REPLACE = {
+    'pre': 'c',
+    'preview': 'c',
+    '-': 'final-',
+    'rc': 'c',
+    'dev': '@',
+    '': None,
+    '.': None,
+}
+
+
+def _legacy_key(s):
+    def get_parts(s):
+        result = []
+        for p in _VERSION_PART.split(s.lower()):
+            p = _VERSION_REPLACE.get(p, p)
+            if p:
+                if '0' <= p[:1] <= '9':
+                    p = p.zfill(8)
+                else:
+                    p = '*' + p
+                result.append(p)
+        result.append('*final')
+        return result
+
+    result = []
+    for p in get_parts(s):
+        if p.startswith('*'):
+            if p < '*final':
+                while result and result[-1] == '*final-':
+                    result.pop()
+            while result and result[-1] == '00000000':
+                result.pop()
+        result.append(p)
+    return tuple(result)
+
+
+class LegacyVersion(Version):
+    def parse(self, s):
+        return _legacy_key(s)
+
+    @property
+    def is_prerelease(self):
+        result = False
+        for x in self._parts:
+            if (isinstance(x, string_types) and x.startswith('*') and x < '*final'):
+                result = True
+                break
+        return result
+
+
+class LegacyMatcher(Matcher):
+    version_class = LegacyVersion
+
+    _operators = dict(Matcher._operators)
+    _operators['~='] = '_match_compatible'
+
+    numeric_re = re.compile(r'^(\d+(\.\d+)*)')
+
+    def _match_compatible(self, version, constraint, prefix):
+        if version < constraint:
+            return False
+        m = self.numeric_re.match(str(constraint))
+        if not m:
+            logger.warning('Cannot compute compatible match for version %s '
+                           ' and constraint %s', version, constraint)
+            return True
+        s = m.groups()[0]
+        if '.' in s:
+            s = s.rsplit('.', 1)[0]
+        return _match_prefix(version, s)
+
+#
+#   Semantic versioning
+#
+
+
+_SEMVER_RE = re.compile(r'^(\d+)\.(\d+)\.(\d+)'
+                        r'(-[a-z0-9]+(\.[a-z0-9-]+)*)?'
+                        r'(\+[a-z0-9]+(\.[a-z0-9-]+)*)?$', re.I)
+
+
+def is_semver(s):
+    return _SEMVER_RE.match(s)
+
+
+def _semantic_key(s):
+    def make_tuple(s, absent):
+        if s is None:
+            result = (absent,)
+        else:
+            parts = s[1:].split('.')
+            # We can't compare ints and strings on Python 3, so fudge it
+            # by zero-filling numeric values so simulate a numeric comparison
+            result = tuple([p.zfill(8) if p.isdigit() else p for p in parts])
+        return result
+
+    m = is_semver(s)
+    if not m:
+        raise UnsupportedVersionError(s)
+    groups = m.groups()
+    major, minor, patch = [int(i) for i in groups[:3]]
+    # choose the '|' and '*' so that versions sort correctly
+    pre, build = make_tuple(groups[3], '|'), make_tuple(groups[5], '*')
+    return (major, minor, patch), pre, build
+
+
+class SemanticVersion(Version):
+    def parse(self, s):
+        return _semantic_key(s)
+
+    @property
+    def is_prerelease(self):
+        return self._parts[1][0] != '|'
+
+
+class SemanticMatcher(Matcher):
+    version_class = SemanticVersion
+
+
+class VersionScheme(object):
+    def __init__(self, key, matcher, suggester=None):
+        self.key = key
+        self.matcher = matcher
+        self.suggester = suggester
+
+    def is_valid_version(self, s):
+        try:
+            self.matcher.version_class(s)
+            result = True
+        except UnsupportedVersionError:
+            result = False
+        return result
+
+    def is_valid_matcher(self, s):
+        try:
+            self.matcher(s)
+            result = True
+        except UnsupportedVersionError:
+            result = False
+        return result
+
+    def is_valid_constraint_list(self, s):
+        """
+        Used for processing some metadata fields
+        """
+        # See issue #140. Be tolerant of a single trailing comma.
+        if s.endswith(','):
+            s = s[:-1]
+        return self.is_valid_matcher('dummy_name (%s)' % s)
+
+    def suggest(self, s):
+        if self.suggester is None:
+            result = None
+        else:
+            result = self.suggester(s)
+        return result
+
+
+_SCHEMES = {
+    'normalized': VersionScheme(_normalized_key, NormalizedMatcher,
+                                _suggest_normalized_version),
+    'legacy': VersionScheme(_legacy_key, LegacyMatcher, lambda self, s: s),
+    'semantic': VersionScheme(_semantic_key, SemanticMatcher,
+                              _suggest_semantic_version),
+}
+
+_SCHEMES['default'] = _SCHEMES['normalized']
+
+
+def get_scheme(name):
+    if name not in _SCHEMES:
+        raise ValueError('unknown scheme name: %r' % name)
+    return _SCHEMES[name]
