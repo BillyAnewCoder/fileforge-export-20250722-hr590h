@@ -1,0 +1,116 @@
+{
+  "train_batch_size": 128,
+  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 4,
+  "gradient_clipping": 1.0,
+  "steps_per_print": 100,
+  "wall_clock_breakdown": false,
+  "dump_state": false,
+  
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 1e-4,
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 0.01
+    }
+  },
+  
+  "scheduler": {
+    "type": "WarmupCosineLR",
+    "params": {
+      "warmup_min_lr": 0,
+      "warmup_max_lr": 1e-4,
+      "warmup_num_steps": 1000,
+      "total_num_steps": 100000
+    }
+  },
+  
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true,
+      "buffer_count": 4,
+      "fast_init": false
+    },
+    "offload_param": {
+      "device": "cpu",
+      "pin_memory": true,
+      "buffer_count": 5,
+      "buffer_size": 100000000,
+      "max_in_cpu": 1000000000
+    },
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "sub_group_size": 1000000000,
+    "reduce_bucket_size": 200000000,
+    "stage3_prefetch_bucket_size": 100000000,
+    "stage3_param_persistence_threshold": 100000,
+    "stage3_max_live_parameters": 1000000000,
+    "stage3_max_reuse_distance": 1000000000,
+    "stage3_gather_16bit_weights_on_model_save": true,
+    "allgather_partitions": true,
+    "allgather_bucket_size": 200000000,
+    "reduce_scatter": true
+  },
+  
+  "moe": {
+    "enabled": true,
+    "num_experts": 8,
+    "top_k": 2,
+    "capacity_factor": 1.25,
+    "eval_capacity_factor": 2.0,
+    "min_capacity": 4,
+    "use_residual": false,
+    "expert_parallel_size": 1,
+    "enable_expert_tensor_parallelism": false,
+    "use_tutel": false
+  },
+  
+  "fp16": {
+    "enabled": true,
+    "auto_cast": false,
+    "loss_scale": 0,
+    "initial_scale_power": 16,
+    "loss_scale_window": 1000,
+    "hysteresis": 2,
+    "consecutive_hysteresis": false,
+    "min_loss_scale": 1
+  },
+  
+  "activation_checkpointing": {
+    "partition_activations": false,
+    "cpu_checkpointing": false,
+    "contiguous_memory_optimization": false,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": false,
+    "profile": false
+  },
+  
+  "communication_data_type": "fp16",
+  "elastic_checkpoint": true,
+  
+  "tensorboard": {
+    "enabled": true,
+    "output_path": "./logs/tensorboard",
+    "job_name": "moe_training"
+  },
+  
+  "comms_logger": {
+    "enabled": false,
+    "verbose": false,
+    "prof_all": false,
+    "debug": false
+  },
+  
+  "flops_profiler": {
+    "enabled": false,
+    "profile_step": 1,
+    "module_depth": -1,
+    "top_modules": 1,
+    "detailed": true,
+    "output_file": null
+  }
+}
