@@ -1,31 +1,21 @@
-"""Wrappers to call pyproject.toml-based build backend hooks.
+"""This is a subpackage because the directory is on sys.path for _in_process.py
+
+The subpackage should stay as empty as possible to avoid shadowing modules that
+the backend might import.
 """
 
-from typing import TYPE_CHECKING
+import importlib.resources as resources
 
-from ._impl import (
-    BackendUnavailable,
-    BuildBackendHookCaller,
-    HookMissing,
-    UnsupportedOperation,
-    default_subprocess_runner,
-    quiet_subprocess_runner,
-)
+try:
+    resources.files
+except AttributeError:
+    # Python 3.8 compatibility
+    def _in_proc_script_path():
+        return resources.path(__package__, "_in_process.py")
 
-__version__ = "1.2.0"
-__all__ = [
-    "BackendUnavailable",
-    "BackendInvalid",
-    "HookMissing",
-    "UnsupportedOperation",
-    "default_subprocess_runner",
-    "quiet_subprocess_runner",
-    "BuildBackendHookCaller",
-]
+else:
 
-BackendInvalid = BackendUnavailable  # Deprecated alias, previously a separate exception
-
-if TYPE_CHECKING:
-    from ._impl import SubprocessRunner
-
-    __all__ += ["SubprocessRunner"]
+    def _in_proc_script_path():
+        return resources.as_file(
+            resources.files(__package__).joinpath("_in_process.py")
+        )
