@@ -1,82 +1,61 @@
 """
-    Pygments
-    ~~~~~~~~
+    pygments.styles
+    ~~~~~~~~~~~~~~~
 
-    Pygments is a syntax highlighting package written in Python.
-
-    It is a generic syntax highlighter for general use in all kinds of software
-    such as forum systems, wikis or other applications that need to prettify
-    source code. Highlights are:
-
-    * a wide range of common languages and markup formats is supported
-    * special attention is paid to details, increasing quality by a fair amount
-    * support for new languages and formats are added easily
-    * a number of output formats, presently HTML, LaTeX, RTF, SVG, all image
-      formats that PIL supports, and ANSI sequences
-    * it is usable as a command-line tool and as a library
-    * ... and it highlights even Brainfuck!
-
-    The `Pygments master branch`_ is installable with ``easy_install Pygments==dev``.
-
-    .. _Pygments master branch:
-       https://github.com/pygments/pygments/archive/master.zip#egg=Pygments-dev
+    Contains built-in styles.
 
     :copyright: Copyright 2006-2025 by the Pygments team, see AUTHORS.
     :license: BSD, see LICENSE for details.
 """
-from io import StringIO, BytesIO
 
-__version__ = '2.19.1'
-__docformat__ = 'restructuredtext'
+from pip._vendor.pygments.plugin import find_plugin_styles
+from pip._vendor.pygments.util import ClassNotFound
+from pip._vendor.pygments.styles._mapping import STYLES
 
-__all__ = ['lex', 'format', 'highlight']
+#: A dictionary of built-in styles, mapping style names to
+#: ``'submodule::classname'`` strings.
+#: This list is deprecated. Use `pygments.styles.STYLES` instead
+STYLE_MAP = {v[1]: v[0].split('.')[-1] + '::' + k for k, v in STYLES.items()}
+
+#: Internal reverse mapping to make `get_style_by_name` more efficient
+_STYLE_NAME_TO_MODULE_MAP = {v[1]: (v[0], k) for k, v in STYLES.items()}
 
 
-def lex(code, lexer):
+def get_style_by_name(name):
     """
-    Lex `code` with the `lexer` (must be a `Lexer` instance)
-    and return an iterable of tokens. Currently, this only calls
-    `lexer.get_tokens()`.
+    Return a style class by its short name. The names of the builtin styles
+    are listed in :data:`pygments.styles.STYLE_MAP`.
+
+    Will raise :exc:`pygments.util.ClassNotFound` if no style of that name is
+    found.
     """
+    if name in _STYLE_NAME_TO_MODULE_MAP:
+        mod, cls = _STYLE_NAME_TO_MODULE_MAP[name]
+        builtin = "yes"
+    else:
+        for found_name, style in find_plugin_styles():
+            if name == found_name:
+                return style
+        # perhaps it got dropped into our styles package
+        builtin = ""
+        mod = 'pygments.styles.' + name
+        cls = name.title() + "Style"
+
     try:
-        return lexer.get_tokens(code)
-    except TypeError:
-        # Heuristic to catch a common mistake.
-        from pip._vendor.pygments.lexer import RegexLexer
-        if isinstance(lexer, type) and issubclass(lexer, RegexLexer):
-            raise TypeError('lex() argument must be a lexer instance, '
-                            'not a class')
-        raise
-
-
-def format(tokens, formatter, outfile=None):  # pylint: disable=redefined-builtin
-    """
-    Format ``tokens`` (an iterable of tokens) with the formatter ``formatter``
-    (a `Formatter` instance).
-
-    If ``outfile`` is given and a valid file object (an object with a
-    ``write`` method), the result will be written to it, otherwise it
-    is returned as a string.
-    """
+        mod = __import__(mod, None, None, [cls])
+    except ImportError:
+        raise ClassNotFound(f"Could not find style module {mod!r}" +
+                            (builtin and ", though it should be builtin")
+                            + ".")
     try:
-        if not outfile:
-            realoutfile = getattr(formatter, 'encoding', None) and BytesIO() or StringIO()
-            formatter.format(tokens, realoutfile)
-            return realoutfile.getvalue()
-        else:
-            formatter.format(tokens, outfile)
-    except TypeError:
-        # Heuristic to catch a common mistake.
-        from pip._vendor.pygments.formatter import Formatter
-        if isinstance(formatter, type) and issubclass(formatter, Formatter):
-            raise TypeError('format() argument must be a formatter instance, '
-                            'not a class')
-        raise
+        return getattr(mod, cls)
+    except AttributeError:
+        raise ClassNotFound(f"Could not find style class {cls!r} in style module.")
 
 
-def highlight(code, lexer, formatter, outfile=None):
-    """
-    This is the most high-level highlighting function. It combines `lex` and
-    `format` in one function.
-    """
-    return format(lex(code, lexer), formatter, outfile)
+def get_all_styles():
+    """Return a generator for all styles by name, both builtin and plugin."""
+    for v in STYLES.values():
+        yield v[1]
+    for name, _ in find_plugin_styles():
+        yield name
