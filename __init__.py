@@ -1,1 +1,1 @@
-"""Contains purely network-related utilities."""
+"""A package that contains models that represent entities."""
