@@ -1,81 +1,53 @@
-import functools
-import os
-import site
-import sys
-import sysconfig
-import typing
+import abc
+from typing import TYPE_CHECKING, Optional
 
-from pip._internal.exceptions import InstallationError
-from pip._internal.utils import appdirs
-from pip._internal.utils.virtualenv import running_under_virtualenv
+from pip._internal.metadata.base import BaseDistribution
+from pip._internal.req import InstallRequirement
 
-# Application Directories
-USER_CACHE_DIR = appdirs.user_cache_dir("pip")
-
-# FIXME doesn't account for venv linked to global site-packages
-site_packages: str = sysconfig.get_path("purelib")
+if TYPE_CHECKING:
+    from pip._internal.index.package_finder import PackageFinder
 
 
-def get_major_minor_version() -> str:
+class AbstractDistribution(metaclass=abc.ABCMeta):
+    """A base class for handling installable artifacts.
+
+    The requirements for anything installable are as follows:
+
+     - we must be able to determine the requirement name
+       (or we can't correctly handle the non-upgrade case).
+
+     - for packages with setup requirements, we must also be able
+       to determine their requirements without installing additional
+       packages (for the same reason as run-time dependencies)
+
+     - we must be able to create a Distribution object exposing the
+       above metadata.
+
+     - if we need to do work in the build tracker, we must be able to generate a unique
+       string to identify the requirement in the build tracker.
     """
-    Return the major-minor version of the current Python as a string, e.g.
-    "3.7" or "3.10".
-    """
-    return "{}.{}".format(*sys.version_info)
 
+    def __init__(self, req: InstallRequirement) -> None:
+        super().__init__()
+        self.req = req
 
-def change_root(new_root: str, pathname: str) -> str:
-    """Return 'pathname' with 'new_root' prepended.
+    @abc.abstractproperty
+    def build_tracker_id(self) -> Optional[str]:
+        """A string that uniquely identifies this requirement to the build tracker.
 
-    If 'pathname' is relative, this is equivalent to os.path.join(new_root, pathname).
-    Otherwise, it requires making 'pathname' relative and then joining the
-    two, which is tricky on DOS/Windows and Mac OS.
+        If None, then this dist has no work to do in the build tracker, and
+        ``.prepare_distribution_metadata()`` will not be called."""
+        raise NotImplementedError()
 
-    This is borrowed from Python's standard library's distutils module.
-    """
-    if os.name == "posix":
-        if not os.path.isabs(pathname):
-            return os.path.join(new_root, pathname)
-        else:
-            return os.path.join(new_root, pathname[1:])
+    @abc.abstractmethod
+    def get_metadata_distribution(self) -> BaseDistribution:
+        raise NotImplementedError()
 
-    elif os.name == "nt":
-        (drive, path) = os.path.splitdrive(pathname)
-        if path[0] == "\\":
-            path = path[1:]
-        return os.path.join(new_root, path)
-
-    else:
-        raise InstallationError(
-            f"Unknown platform: {os.name}\n"
-            "Can not change root path prefix on unknown platform."
-        )
-
-
-def get_src_prefix() -> str:
-    if running_under_virtualenv():
-        src_prefix = os.path.join(sys.prefix, "src")
-    else:
-        # FIXME: keep src in cwd for now (it is not a temporary folder)
-        try:
-            src_prefix = os.path.join(os.getcwd(), "src")
-        except OSError:
-            # In case the current working directory has been renamed or deleted
-            sys.exit("The folder you are executing pip from can no longer be found.")
-
-    # under macOS + virtualenv sys.prefix is not properly resolved
-    # it is something like /path/to/python/bin/..
-    return os.path.abspath(src_prefix)
-
-
-try:
-    # Use getusersitepackages if this is present, as it ensures that the
-    # value is initialised properly.
-    user_site: typing.Optional[str] = site.getusersitepackages()
-except AttributeError:
-    user_site = site.USER_SITE
-
-
-@functools.lru_cache(maxsize=None)
-def is_osx_framework() -> bool:
-    return bool(sysconfig.get_config_var("PYTHONFRAMEWORK"))
+    @abc.abstractmethod
+    def prepare_distribution_metadata(
+        self,
+        finder: "PackageFinder",
+        build_isolation: bool,
+        check_build_deps: bool,
+    ) -> None:
+        raise NotImplementedError()
