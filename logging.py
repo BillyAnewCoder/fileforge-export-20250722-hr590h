@@ -1,297 +1,361 @@
+import contextlib
+import errno
 import logging
-from datetime import datetime
-from logging import Handler, LogRecord
-from pathlib import Path
-from types import ModuleType
-from typing import ClassVar, Iterable, List, Optional, Type, Union
+import logging.handlers
+import os
+import sys
+import threading
+from dataclasses import dataclass
+from io import TextIOWrapper
+from logging import Filter
+from typing import Any, ClassVar, Generator, List, Optional, Type
 
-from pip._vendor.rich._null_file import NullFile
+from pip._vendor.rich.console import (
+    Console,
+    ConsoleOptions,
+    ConsoleRenderable,
+    RenderableType,
+    RenderResult,
+    RichCast,
+)
+from pip._vendor.rich.highlighter import NullHighlighter
+from pip._vendor.rich.logging import RichHandler
+from pip._vendor.rich.segment import Segment
+from pip._vendor.rich.style import Style
 
-from . import get_console
-from ._log_render import FormatTimeCallable, LogRender
-from .console import Console, ConsoleRenderable
-from .highlighter import Highlighter, ReprHighlighter
-from .text import Text
-from .traceback import Traceback
+from pip._internal.utils._log import VERBOSE, getLogger
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.deprecation import DEPRECATION_MSG_PREFIX
+from pip._internal.utils.misc import ensure_dir
+
+_log_state = threading.local()
+_stdout_console = None
+_stderr_console = None
+subprocess_logger = getLogger("pip.subprocessor")
 
 
-class RichHandler(Handler):
-    """A logging handler that renders output with Rich. The time / level / message and file are displayed in columns.
-    The level is color coded, and the message is syntax highlighted.
-
-    Note:
-        Be careful when enabling console markup in log messages if you have configured logging for libraries not
-        under your control. If a dependency writes messages containing square brackets, it may not produce the intended output.
-
-    Args:
-        level (Union[int, str], optional): Log level. Defaults to logging.NOTSET.
-        console (:class:`~rich.console.Console`, optional): Optional console instance to write logs.
-            Default will use a global console instance writing to stdout.
-        show_time (bool, optional): Show a column for the time. Defaults to True.
-        omit_repeated_times (bool, optional): Omit repetition of the same time. Defaults to True.
-        show_level (bool, optional): Show a column for the level. Defaults to True.
-        show_path (bool, optional): Show the path to the original log call. Defaults to True.
-        enable_link_path (bool, optional): Enable terminal link of path column to file. Defaults to True.
-        highlighter (Highlighter, optional): Highlighter to style log messages, or None to use ReprHighlighter. Defaults to None.
-        markup (bool, optional): Enable console markup in log messages. Defaults to False.
-        rich_tracebacks (bool, optional): Enable rich tracebacks with syntax highlighting and formatting. Defaults to False.
-        tracebacks_width (Optional[int], optional): Number of characters used to render tracebacks, or None for full width. Defaults to None.
-        tracebacks_code_width (int, optional): Number of code characters used to render tracebacks, or None for full width. Defaults to 88.
-        tracebacks_extra_lines (int, optional): Additional lines of code to render tracebacks, or None for full width. Defaults to None.
-        tracebacks_theme (str, optional): Override pygments theme used in traceback.
-        tracebacks_word_wrap (bool, optional): Enable word wrapping of long tracebacks lines. Defaults to True.
-        tracebacks_show_locals (bool, optional): Enable display of locals in tracebacks. Defaults to False.
-        tracebacks_suppress (Sequence[Union[str, ModuleType]]): Optional sequence of modules or paths to exclude from traceback.
-        tracebacks_max_frames (int, optional): Optional maximum number of frames returned by traceback.
-        locals_max_length (int, optional): Maximum length of containers before abbreviating, or None for no abbreviation.
-            Defaults to 10.
-        locals_max_string (int, optional): Maximum length of string before truncating, or None to disable. Defaults to 80.
-        log_time_format (Union[str, TimeFormatterCallable], optional): If ``log_time`` is enabled, either string for strftime or callable that formats the time. Defaults to "[%x %X] ".
-        keywords (List[str], optional): List of words to highlight instead of ``RichHandler.KEYWORDS``.
+class BrokenStdoutLoggingError(Exception):
+    """
+    Raised if BrokenPipeError occurs for the stdout stream while logging.
     """
 
-    KEYWORDS: ClassVar[Optional[List[str]]] = [
-        "GET",
-        "POST",
-        "HEAD",
-        "PUT",
-        "DELETE",
-        "OPTIONS",
-        "TRACE",
-        "PATCH",
-    ]
-    HIGHLIGHTER_CLASS: ClassVar[Type[Highlighter]] = ReprHighlighter
+
+def _is_broken_pipe_error(exc_class: Type[BaseException], exc: BaseException) -> bool:
+    if exc_class is BrokenPipeError:
+        return True
+
+    # On Windows, a broken pipe can show up as EINVAL rather than EPIPE:
+    # https://bugs.python.org/issue19612
+    # https://bugs.python.org/issue30418
+    if not WINDOWS:
+        return False
+
+    return isinstance(exc, OSError) and exc.errno in (errno.EINVAL, errno.EPIPE)
+
+
+@contextlib.contextmanager
+def indent_log(num: int = 2) -> Generator[None, None, None]:
+    """
+    A context manager which will cause the log output to be indented for any
+    log messages emitted inside it.
+    """
+    # For thread-safety
+    _log_state.indentation = get_indentation()
+    _log_state.indentation += num
+    try:
+        yield
+    finally:
+        _log_state.indentation -= num
+
+
+def get_indentation() -> int:
+    return getattr(_log_state, "indentation", 0)
+
+
+class IndentingFormatter(logging.Formatter):
+    default_time_format = "%Y-%m-%dT%H:%M:%S"
 
     def __init__(
         self,
-        level: Union[int, str] = logging.NOTSET,
-        console: Optional[Console] = None,
-        *,
-        show_time: bool = True,
-        omit_repeated_times: bool = True,
-        show_level: bool = True,
-        show_path: bool = True,
-        enable_link_path: bool = True,
-        highlighter: Optional[Highlighter] = None,
-        markup: bool = False,
-        rich_tracebacks: bool = False,
-        tracebacks_width: Optional[int] = None,
-        tracebacks_code_width: int = 88,
-        tracebacks_extra_lines: int = 3,
-        tracebacks_theme: Optional[str] = None,
-        tracebacks_word_wrap: bool = True,
-        tracebacks_show_locals: bool = False,
-        tracebacks_suppress: Iterable[Union[str, ModuleType]] = (),
-        tracebacks_max_frames: int = 100,
-        locals_max_length: int = 10,
-        locals_max_string: int = 80,
-        log_time_format: Union[str, FormatTimeCallable] = "[%x %X]",
-        keywords: Optional[List[str]] = None,
+        *args: Any,
+        add_timestamp: bool = False,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(level=level)
-        self.console = console or get_console()
-        self.highlighter = highlighter or self.HIGHLIGHTER_CLASS()
-        self._log_render = LogRender(
-            show_time=show_time,
-            show_level=show_level,
-            show_path=show_path,
-            time_format=log_time_format,
-            omit_repeated_times=omit_repeated_times,
-            level_width=None,
-        )
-        self.enable_link_path = enable_link_path
-        self.markup = markup
-        self.rich_tracebacks = rich_tracebacks
-        self.tracebacks_width = tracebacks_width
-        self.tracebacks_extra_lines = tracebacks_extra_lines
-        self.tracebacks_theme = tracebacks_theme
-        self.tracebacks_word_wrap = tracebacks_word_wrap
-        self.tracebacks_show_locals = tracebacks_show_locals
-        self.tracebacks_suppress = tracebacks_suppress
-        self.tracebacks_max_frames = tracebacks_max_frames
-        self.tracebacks_code_width = tracebacks_code_width
-        self.locals_max_length = locals_max_length
-        self.locals_max_string = locals_max_string
-        self.keywords = keywords
-
-    def get_level_text(self, record: LogRecord) -> Text:
-        """Get the level name from the record.
-
-        Args:
-            record (LogRecord): LogRecord instance.
-
-        Returns:
-            Text: A tuple of the style and level name.
         """
-        level_name = record.levelname
-        level_text = Text.styled(
-            level_name.ljust(8), f"logging.level.{level_name.lower()}"
-        )
-        return level_text
+        A logging.Formatter that obeys the indent_log() context manager.
 
-    def emit(self, record: LogRecord) -> None:
-        """Invoked by logging."""
-        message = self.format(record)
-        traceback = None
-        if (
-            self.rich_tracebacks
-            and record.exc_info
-            and record.exc_info != (None, None, None)
-        ):
-            exc_type, exc_value, exc_traceback = record.exc_info
-            assert exc_type is not None
-            assert exc_value is not None
-            traceback = Traceback.from_exception(
-                exc_type,
-                exc_value,
-                exc_traceback,
-                width=self.tracebacks_width,
-                code_width=self.tracebacks_code_width,
-                extra_lines=self.tracebacks_extra_lines,
-                theme=self.tracebacks_theme,
-                word_wrap=self.tracebacks_word_wrap,
-                show_locals=self.tracebacks_show_locals,
-                locals_max_length=self.locals_max_length,
-                locals_max_string=self.locals_max_string,
-                suppress=self.tracebacks_suppress,
-                max_frames=self.tracebacks_max_frames,
+        :param add_timestamp: A bool indicating output lines should be prefixed
+            with their record's timestamp.
+        """
+        self.add_timestamp = add_timestamp
+        super().__init__(*args, **kwargs)
+
+    def get_message_start(self, formatted: str, levelno: int) -> str:
+        """
+        Return the start of the formatted log message (not counting the
+        prefix to add to each line).
+        """
+        if levelno < logging.WARNING:
+            return ""
+        if formatted.startswith(DEPRECATION_MSG_PREFIX):
+            # Then the message already has a prefix.  We don't want it to
+            # look like "WARNING: DEPRECATION: ...."
+            return ""
+        if levelno < logging.ERROR:
+            return "WARNING: "
+
+        return "ERROR: "
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        Calls the standard formatter, but will indent all of the log message
+        lines by our current indentation level.
+        """
+        formatted = super().format(record)
+        message_start = self.get_message_start(formatted, record.levelno)
+        formatted = message_start + formatted
+
+        prefix = ""
+        if self.add_timestamp:
+            prefix = f"{self.formatTime(record)} "
+        prefix += " " * get_indentation()
+        formatted = "".join([prefix + line for line in formatted.splitlines(True)])
+        return formatted
+
+
+@dataclass
+class IndentedRenderable:
+    renderable: RenderableType
+    indent: int
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        segments = console.render(self.renderable, options)
+        lines = Segment.split_lines(segments)
+        for line in lines:
+            yield Segment(" " * self.indent)
+            yield from line
+            yield Segment("\n")
+
+
+class PipConsole(Console):
+    def on_broken_pipe(self) -> None:
+        # Reraise the original exception, rich 13.8.0+ exits by default
+        # instead, preventing our handler from firing.
+        raise BrokenPipeError() from None
+
+
+def get_console(*, stderr: bool = False) -> Console:
+    if stderr:
+        assert _stderr_console is not None, "stderr rich console is missing!"
+        return _stderr_console
+    else:
+        assert _stdout_console is not None, "stdout rich console is missing!"
+        return _stdout_console
+
+
+class RichPipStreamHandler(RichHandler):
+    KEYWORDS: ClassVar[Optional[List[str]]] = []
+
+    def __init__(self, console: Console) -> None:
+        super().__init__(
+            console=console,
+            show_time=False,
+            show_level=False,
+            show_path=False,
+            highlighter=NullHighlighter(),
+        )
+
+    # Our custom override on Rich's logger, to make things work as we need them to.
+    def emit(self, record: logging.LogRecord) -> None:
+        style: Optional[Style] = None
+
+        # If we are given a diagnostic error to present, present it with indentation.
+        if getattr(record, "rich", False):
+            assert isinstance(record.args, tuple)
+            (rich_renderable,) = record.args
+            assert isinstance(
+                rich_renderable, (ConsoleRenderable, RichCast, str)
+            ), f"{rich_renderable} is not rich-console-renderable"
+
+            renderable: RenderableType = IndentedRenderable(
+                rich_renderable, indent=get_indentation()
             )
-            message = record.getMessage()
-            if self.formatter:
-                record.message = record.getMessage()
-                formatter = self.formatter
-                if hasattr(formatter, "usesTime") and formatter.usesTime():
-                    record.asctime = formatter.formatTime(record, formatter.datefmt)
-                message = formatter.formatMessage(record)
-
-        message_renderable = self.render_message(record, message)
-        log_renderable = self.render(
-            record=record, traceback=traceback, message_renderable=message_renderable
-        )
-        if isinstance(self.console.file, NullFile):
-            # Handles pythonw, where stdout/stderr are null, and we return NullFile
-            # instance from Console.file. In this case, we still want to make a log record
-            # even though we won't be writing anything to a file.
-            self.handleError(record)
         else:
-            try:
-                self.console.print(log_renderable)
-            except Exception:
-                self.handleError(record)
+            message = self.format(record)
+            renderable = self.render_message(record, message)
+            if record.levelno is not None:
+                if record.levelno >= logging.ERROR:
+                    style = Style(color="red")
+                elif record.levelno >= logging.WARNING:
+                    style = Style(color="yellow")
 
-    def render_message(self, record: LogRecord, message: str) -> "ConsoleRenderable":
-        """Render message text in to Text.
-
-        Args:
-            record (LogRecord): logging Record.
-            message (str): String containing log message.
-
-        Returns:
-            ConsoleRenderable: Renderable to display log message.
-        """
-        use_markup = getattr(record, "markup", self.markup)
-        message_text = Text.from_markup(message) if use_markup else Text(message)
-
-        highlighter = getattr(record, "highlighter", self.highlighter)
-        if highlighter:
-            message_text = highlighter(message_text)
-
-        if self.keywords is None:
-            self.keywords = self.KEYWORDS
-
-        if self.keywords:
-            message_text.highlight_words(self.keywords, "logging.keyword")
-
-        return message_text
-
-    def render(
-        self,
-        *,
-        record: LogRecord,
-        traceback: Optional[Traceback],
-        message_renderable: "ConsoleRenderable",
-    ) -> "ConsoleRenderable":
-        """Render log for display.
-
-        Args:
-            record (LogRecord): logging Record.
-            traceback (Optional[Traceback]): Traceback instance or None for no Traceback.
-            message_renderable (ConsoleRenderable): Renderable (typically Text) containing log message contents.
-
-        Returns:
-            ConsoleRenderable: Renderable to display log.
-        """
-        path = Path(record.pathname).name
-        level = self.get_level_text(record)
-        time_format = None if self.formatter is None else self.formatter.datefmt
-        log_time = datetime.fromtimestamp(record.created)
-
-        log_renderable = self._log_render(
-            self.console,
-            [message_renderable] if not traceback else [message_renderable, traceback],
-            log_time=log_time,
-            time_format=time_format,
-            level=level,
-            path=path,
-            line_no=record.lineno,
-            link_path=record.pathname if self.enable_link_path else None,
-        )
-        return log_renderable
-
-
-if __name__ == "__main__":  # pragma: no cover
-    from time import sleep
-
-    FORMAT = "%(message)s"
-    # FORMAT = "%(asctime)-15s - %(levelname)s - %(message)s"
-    logging.basicConfig(
-        level="NOTSET",
-        format=FORMAT,
-        datefmt="[%X]",
-        handlers=[RichHandler(rich_tracebacks=True, tracebacks_show_locals=True)],
-    )
-    log = logging.getLogger("rich")
-
-    log.info("Server starting...")
-    log.info("Listening on http://127.0.0.1:8080")
-    sleep(1)
-
-    log.info("GET /index.html 200 1298")
-    log.info("GET /imgs/backgrounds/back1.jpg 200 54386")
-    log.info("GET /css/styles.css 200 54386")
-    log.warning("GET /favicon.ico 404 242")
-    sleep(1)
-
-    log.debug(
-        "JSONRPC request\n--> %r\n<-- %r",
-        {
-            "version": "1.1",
-            "method": "confirmFruitPurchase",
-            "params": [["apple", "orange", "mangoes", "pomelo"], 1.123],
-            "id": "194521489",
-        },
-        {"version": "1.1", "result": True, "error": None, "id": "194521489"},
-    )
-    log.debug(
-        "Loading configuration file /adasd/asdasd/qeqwe/qwrqwrqwr/sdgsdgsdg/werwerwer/dfgerert/ertertert/ertetert/werwerwer"
-    )
-    log.error("Unable to find 'pomelo' in database!")
-    log.info("POST /jsonrpc/ 200 65532")
-    log.info("POST /admin/ 401 42234")
-    log.warning("password was rejected for admin site.")
-
-    def divide() -> None:
-        number = 1
-        divisor = 0
-        foos = ["foo"] * 100
-        log.debug("in divide")
         try:
-            number / divisor
-        except:
-            log.exception("An error of some kind occurred!")
+            self.console.print(renderable, overflow="ignore", crop=False, style=style)
+        except Exception:
+            self.handleError(record)
 
-    divide()
-    sleep(1)
-    log.critical("Out of memory!")
-    log.info("Server exited with code=-1")
-    log.info("[bold]EXITING...[/bold]", extra=dict(markup=True))
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Called when logging is unable to log some output."""
+
+        exc_class, exc = sys.exc_info()[:2]
+        # If a broken pipe occurred while calling write() or flush() on the
+        # stdout stream in logging's Handler.emit(), then raise our special
+        # exception so we can handle it in main() instead of logging the
+        # broken pipe error and continuing.
+        if (
+            exc_class
+            and exc
+            and self.console.file is sys.stdout
+            and _is_broken_pipe_error(exc_class, exc)
+        ):
+            raise BrokenStdoutLoggingError()
+
+        return super().handleError(record)
+
+
+class BetterRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def _open(self) -> TextIOWrapper:
+        ensure_dir(os.path.dirname(self.baseFilename))
+        return super()._open()
+
+
+class MaxLevelFilter(Filter):
+    def __init__(self, level: int) -> None:
+        self.level = level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.level
+
+
+class ExcludeLoggerFilter(Filter):
+    """
+    A logging Filter that excludes records from a logger (or its children).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # The base Filter class allows only records from a logger (or its
+        # children).
+        return not super().filter(record)
+
+
+def setup_logging(verbosity: int, no_color: bool, user_log_file: Optional[str]) -> int:
+    """Configures and sets up all of the logging
+
+    Returns the requested logging level, as its integer value.
+    """
+
+    # Determine the level to be logging at.
+    if verbosity >= 2:
+        level_number = logging.DEBUG
+    elif verbosity == 1:
+        level_number = VERBOSE
+    elif verbosity == -1:
+        level_number = logging.WARNING
+    elif verbosity == -2:
+        level_number = logging.ERROR
+    elif verbosity <= -3:
+        level_number = logging.CRITICAL
+    else:
+        level_number = logging.INFO
+
+    level = logging.getLevelName(level_number)
+
+    # The "root" logger should match the "console" level *unless* we also need
+    # to log to a user log file.
+    include_user_log = user_log_file is not None
+    if include_user_log:
+        additional_log_file = user_log_file
+        root_level = "DEBUG"
+    else:
+        additional_log_file = "/dev/null"
+        root_level = level
+
+    # Disable any logging besides WARNING unless we have DEBUG level logging
+    # enabled for vendored libraries.
+    vendored_log_level = "WARNING" if level in ["INFO", "ERROR"] else "DEBUG"
+
+    # Shorthands for clarity
+    handler_classes = {
+        "stream": "pip._internal.utils.logging.RichPipStreamHandler",
+        "file": "pip._internal.utils.logging.BetterRotatingFileHandler",
+    }
+    handlers = ["console", "console_errors", "console_subprocess"] + (
+        ["user_log"] if include_user_log else []
+    )
+    global _stdout_console, stderr_console
+    _stdout_console = PipConsole(file=sys.stdout, no_color=no_color, soft_wrap=True)
+    _stderr_console = PipConsole(file=sys.stderr, no_color=no_color, soft_wrap=True)
+
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "filters": {
+                "exclude_warnings": {
+                    "()": "pip._internal.utils.logging.MaxLevelFilter",
+                    "level": logging.WARNING,
+                },
+                "restrict_to_subprocess": {
+                    "()": "logging.Filter",
+                    "name": subprocess_logger.name,
+                },
+                "exclude_subprocess": {
+                    "()": "pip._internal.utils.logging.ExcludeLoggerFilter",
+                    "name": subprocess_logger.name,
+                },
+            },
+            "formatters": {
+                "indent": {
+                    "()": IndentingFormatter,
+                    "format": "%(message)s",
+                },
+                "indent_with_timestamp": {
+                    "()": IndentingFormatter,
+                    "format": "%(message)s",
+                    "add_timestamp": True,
+                },
+            },
+            "handlers": {
+                "console": {
+                    "level": level,
+                    "class": handler_classes["stream"],
+                    "console": _stdout_console,
+                    "filters": ["exclude_subprocess", "exclude_warnings"],
+                    "formatter": "indent",
+                },
+                "console_errors": {
+                    "level": "WARNING",
+                    "class": handler_classes["stream"],
+                    "console": _stderr_console,
+                    "filters": ["exclude_subprocess"],
+                    "formatter": "indent",
+                },
+                # A handler responsible for logging to the console messages
+                # from the "subprocessor" logger.
+                "console_subprocess": {
+                    "level": level,
+                    "class": handler_classes["stream"],
+                    "console": _stderr_console,
+                    "filters": ["restrict_to_subprocess"],
+                    "formatter": "indent",
+                },
+                "user_log": {
+                    "level": "DEBUG",
+                    "class": handler_classes["file"],
+                    "filename": additional_log_file,
+                    "encoding": "utf-8",
+                    "delay": True,
+                    "formatter": "indent_with_timestamp",
+                },
+            },
+            "root": {
+                "level": root_level,
+                "handlers": handlers,
+            },
+            "loggers": {"pip._vendor": {"level": vendored_log_level}},
+        }
+    )
+
+    return level_number
