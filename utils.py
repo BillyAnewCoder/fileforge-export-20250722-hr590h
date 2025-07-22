@@ -1,163 +1,98 @@
-# This file is dual licensed under the terms of the Apache License, Version
-# 2.0, and the BSD License. See the LICENSE file in the root of this repository
-# for complete details.
+from typing import Dict, Generator
 
-from __future__ import annotations
+from pip._vendor.requests.models import Response
 
-import functools
-import re
-from typing import NewType, Tuple, Union, cast
+from pip._internal.exceptions import NetworkConnectionError
 
-from .tags import Tag, parse_tag
-from .version import InvalidVersion, Version, _TrimmedRelease
+# The following comments and HTTP headers were originally added by
+# Donald Stufft in git commit 22c562429a61bb77172039e480873fb239dd8c03.
+#
+# We use Accept-Encoding: identity here because requests defaults to
+# accepting compressed responses. This breaks in a variety of ways
+# depending on how the server is configured.
+# - Some servers will notice that the file isn't a compressible file
+#   and will leave the file alone and with an empty Content-Encoding
+# - Some servers will notice that the file is already compressed and
+#   will leave the file alone, adding a Content-Encoding: gzip header
+# - Some servers won't notice anything at all and will take a file
+#   that's already been compressed and compress it again, and set
+#   the Content-Encoding: gzip header
+# By setting this to request only the identity encoding we're hoping
+# to eliminate the third case.  Hopefully there does not exist a server
+# which when given a file will notice it is already compressed and that
+# you're not asking for a compressed file and will then decompress it
+# before sending because if that's the case I don't think it'll ever be
+# possible to make this work.
+HEADERS: Dict[str, str] = {"Accept-Encoding": "identity"}
 
-BuildTag = Union[Tuple[()], Tuple[int, str]]
-NormalizedName = NewType("NormalizedName", str)
-
-
-class InvalidName(ValueError):
-    """
-    An invalid distribution name; users should refer to the packaging user guide.
-    """
-
-
-class InvalidWheelFilename(ValueError):
-    """
-    An invalid wheel filename was found, users should refer to PEP 427.
-    """
-
-
-class InvalidSdistFilename(ValueError):
-    """
-    An invalid sdist filename was found, users should refer to the packaging user guide.
-    """
+DOWNLOAD_CHUNK_SIZE = 256 * 1024
 
 
-# Core metadata spec for `Name`
-_validate_regex = re.compile(
-    r"^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$", re.IGNORECASE
-)
-_canonicalize_regex = re.compile(r"[-_.]+")
-_normalized_regex = re.compile(r"^([a-z0-9]|[a-z0-9]([a-z0-9-](?!--))*[a-z0-9])$")
-# PEP 427: The build number must start with a digit.
-_build_tag_regex = re.compile(r"(\d+)(.*)")
-
-
-def canonicalize_name(name: str, *, validate: bool = False) -> NormalizedName:
-    if validate and not _validate_regex.match(name):
-        raise InvalidName(f"name is invalid: {name!r}")
-    # This is taken from PEP 503.
-    value = _canonicalize_regex.sub("-", name).lower()
-    return cast(NormalizedName, value)
-
-
-def is_normalized_name(name: str) -> bool:
-    return _normalized_regex.match(name) is not None
-
-
-@functools.singledispatch
-def canonicalize_version(
-    version: Version | str, *, strip_trailing_zero: bool = True
-) -> str:
-    """
-    Return a canonical form of a version as a string.
-
-    >>> canonicalize_version('1.0.1')
-    '1.0.1'
-
-    Per PEP 625, versions may have multiple canonical forms, differing
-    only by trailing zeros.
-
-    >>> canonicalize_version('1.0.0')
-    '1'
-    >>> canonicalize_version('1.0.0', strip_trailing_zero=False)
-    '1.0.0'
-
-    Invalid versions are returned unaltered.
-
-    >>> canonicalize_version('foo bar baz')
-    'foo bar baz'
-    """
-    return str(_TrimmedRelease(str(version)) if strip_trailing_zero else version)
-
-
-@canonicalize_version.register
-def _(version: str, *, strip_trailing_zero: bool = True) -> str:
-    try:
-        parsed = Version(version)
-    except InvalidVersion:
-        # Legacy versions cannot be normalized
-        return version
-    return canonicalize_version(parsed, strip_trailing_zero=strip_trailing_zero)
-
-
-def parse_wheel_filename(
-    filename: str,
-) -> tuple[NormalizedName, Version, BuildTag, frozenset[Tag]]:
-    if not filename.endswith(".whl"):
-        raise InvalidWheelFilename(
-            f"Invalid wheel filename (extension must be '.whl'): {filename!r}"
-        )
-
-    filename = filename[:-4]
-    dashes = filename.count("-")
-    if dashes not in (4, 5):
-        raise InvalidWheelFilename(
-            f"Invalid wheel filename (wrong number of parts): {filename!r}"
-        )
-
-    parts = filename.split("-", dashes - 2)
-    name_part = parts[0]
-    # See PEP 427 for the rules on escaping the project name.
-    if "__" in name_part or re.match(r"^[\w\d._]*$", name_part, re.UNICODE) is None:
-        raise InvalidWheelFilename(f"Invalid project name: {filename!r}")
-    name = canonicalize_name(name_part)
-
-    try:
-        version = Version(parts[1])
-    except InvalidVersion as e:
-        raise InvalidWheelFilename(
-            f"Invalid wheel filename (invalid version): {filename!r}"
-        ) from e
-
-    if dashes == 5:
-        build_part = parts[2]
-        build_match = _build_tag_regex.match(build_part)
-        if build_match is None:
-            raise InvalidWheelFilename(
-                f"Invalid build number: {build_part} in {filename!r}"
-            )
-        build = cast(BuildTag, (int(build_match.group(1)), build_match.group(2)))
+def raise_for_status(resp: Response) -> None:
+    http_error_msg = ""
+    if isinstance(resp.reason, bytes):
+        # We attempt to decode utf-8 first because some servers
+        # choose to localize their reason strings. If the string
+        # isn't utf-8, we fall back to iso-8859-1 for all other
+        # encodings.
+        try:
+            reason = resp.reason.decode("utf-8")
+        except UnicodeDecodeError:
+            reason = resp.reason.decode("iso-8859-1")
     else:
-        build = ()
-    tags = parse_tag(parts[-1])
-    return (name, version, build, tags)
+        reason = resp.reason
 
-
-def parse_sdist_filename(filename: str) -> tuple[NormalizedName, Version]:
-    if filename.endswith(".tar.gz"):
-        file_stem = filename[: -len(".tar.gz")]
-    elif filename.endswith(".zip"):
-        file_stem = filename[: -len(".zip")]
-    else:
-        raise InvalidSdistFilename(
-            f"Invalid sdist filename (extension must be '.tar.gz' or '.zip'):"
-            f" {filename!r}"
+    if 400 <= resp.status_code < 500:
+        http_error_msg = (
+            f"{resp.status_code} Client Error: {reason} for url: {resp.url}"
         )
 
-    # We are requiring a PEP 440 version, which cannot contain dashes,
-    # so we split on the last dash.
-    name_part, sep, version_part = file_stem.rpartition("-")
-    if not sep:
-        raise InvalidSdistFilename(f"Invalid sdist filename: {filename!r}")
+    elif 500 <= resp.status_code < 600:
+        http_error_msg = (
+            f"{resp.status_code} Server Error: {reason} for url: {resp.url}"
+        )
 
-    name = canonicalize_name(name_part)
+    if http_error_msg:
+        raise NetworkConnectionError(http_error_msg, response=resp)
 
+
+def response_chunks(
+    response: Response, chunk_size: int = DOWNLOAD_CHUNK_SIZE
+) -> Generator[bytes, None, None]:
+    """Given a requests Response, provide the data chunks."""
     try:
-        version = Version(version_part)
-    except InvalidVersion as e:
-        raise InvalidSdistFilename(
-            f"Invalid sdist filename (invalid version): {filename!r}"
-        ) from e
-
-    return (name, version)
+        # Special case for urllib3.
+        for chunk in response.raw.stream(
+            chunk_size,
+            # We use decode_content=False here because we don't
+            # want urllib3 to mess with the raw bytes we get
+            # from the server. If we decompress inside of
+            # urllib3 then we cannot verify the checksum
+            # because the checksum will be of the compressed
+            # file. This breakage will only occur if the
+            # server adds a Content-Encoding header, which
+            # depends on how the server was configured:
+            # - Some servers will notice that the file isn't a
+            #   compressible file and will leave the file alone
+            #   and with an empty Content-Encoding
+            # - Some servers will notice that the file is
+            #   already compressed and will leave the file
+            #   alone and will add a Content-Encoding: gzip
+            #   header
+            # - Some servers won't notice anything at all and
+            #   will take a file that's already been compressed
+            #   and compress it again and set the
+            #   Content-Encoding: gzip header
+            #
+            # By setting this not to decode automatically we
+            # hope to eliminate problems with the second case.
+            decode_content=False,
+        ):
+            yield chunk
+    except AttributeError:
+        # Standard file-like object.
+        while True:
+            chunk = response.raw.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
